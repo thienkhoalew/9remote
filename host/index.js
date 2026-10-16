@@ -131,6 +131,7 @@ function serveStatic(res, filePath, { frameable = false } = {}) {
 }
 
 async function checkForUpdate(currentVersion) {
+  if (currentVersion.includes("-wayland.")) return;
   try {
     const res = await browserFetch(NPM_REGISTRY_URL);
     if (!res.ok) return;

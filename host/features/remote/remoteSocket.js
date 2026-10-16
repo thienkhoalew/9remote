@@ -7,6 +7,8 @@ import * as desktopBridge from "../../lib/desktopBridge.js";
 import { REMOTE_CONFIG } from "./REMOTE_CONFIG.js";
 import { readClipboardText } from "./utils/clipboard.js";
 
+import { useGnomeWayland, checkGnomeWayland, gnomeWayland } from "./adapters/gnomeWayland.js";
+
 const logger = createLogger("remote");
 
 // Track remote availability globally
@@ -16,7 +18,7 @@ function isKnownHeadless() {
   return (
     process.env.CODESPACES === "true" ||
     process.env.GITPOD_WORKSPACE_ID ||
-    (process.platform === "linux" && !process.env.DISPLAY)
+    (process.platform === "linux" && !process.env.DISPLAY && !useGnomeWayland)
   );
 }
 
@@ -28,9 +30,13 @@ export async function checkRemoteAvailable() {
     return remoteAvailable;
   }
   try {
-    const robotModule = await import("@hurdlegroup/robotjs");
-    const robot = robotModule.default || robotModule;
-    robot.getScreenSize();
+    if (useGnomeWayland) {
+      checkGnomeWayland();
+    } else {
+      const robotModule = await import("@hurdlegroup/robotjs");
+      const robot = robotModule.default || robotModule;
+      robot.getScreenSize();
+    }
     remoteAvailable = true;
   } catch {
     remoteAvailable = false;
@@ -82,10 +88,18 @@ async function enablePerMonitorDpiAwareness() {
 // robotjs caches its view of the screen.
 
 async function loadRemoteModules() {
-  if (robot && TileManager && ResourceManager) return true;
+  if (robot && TileManager && ResourceManager) {
+    if (useGnomeWayland) await gnomeWayland.start();
+    return true;
+  }
   try {
-    const robotModule = await import("@hurdlegroup/robotjs");
-    robot = robotModule.default || robotModule;
+    if (useGnomeWayland) {
+      await gnomeWayland.start();
+      robot = gnomeWayland;
+    } else {
+      const robotModule = await import("@hurdlegroup/robotjs");
+      robot = robotModule.default || robotModule;
+    }
     const { TileManager: TM } = await import("./TileManager.js");
     const { ResourceManager: RM } = await import("./ResourceManager.js");
     const { MouseHandler: MH } = await import("./handlers/MouseHandler.js");

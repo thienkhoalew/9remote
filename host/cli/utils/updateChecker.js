@@ -86,6 +86,7 @@ export function stopRunningInstances() {
 }
 
 export async function checkForUpdates() {
+  if (getCurrentVersion()?.includes("-wayland.")) return null;
   try {
     const currentVersion = getCurrentVersion();
     if (!currentVersion) return;
@@ -110,6 +111,7 @@ export async function checkForUpdates() {
 }
 
 export async function checkLatestVersion() {
+  if (getCurrentVersion()?.includes("-wayland.")) return null;
   try {
     const currentVersion = getCurrentVersion();
     if (!currentVersion) return null;
@@ -608,6 +610,7 @@ async function runDockerUpdate(currentVersion) {
 }
 
 export async function runWebUpdate() {
+  if (getCurrentVersion()?.includes("-wayland.")) return null;
   const currentVersion = getCurrentVersion();
   if (!currentVersion) { logger.warn("update skipped: no version (source run?)"); return false; }
   if (IS_DOCKER) return runDockerUpdate(currentVersion);

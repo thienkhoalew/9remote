@@ -1,3 +1,4 @@
+import { useGnomeWayland, gnomeWayland } from "./gnomeWayland.js";
 // Capture adapter — unified API over robotjs (BGRA) and node-screenshots (RGBA/DXGI GPU)
 // Returns { buffer, width, height, channels, format }
 import { REMOTE_CONFIG } from "../REMOTE_CONFIG.js";
@@ -19,6 +20,7 @@ async function getMonitor() {
 
 export async function initCapture(robot) {
   robotRef = robot;
+  if (useGnomeWayland) return;
   // Pre-warm node-screenshots if selected
   if (REMOTE_CONFIG.pipeline.captureLib === "nodeScreenshots") {
     await getMonitor();
@@ -47,6 +49,7 @@ export async function initCapture(robot) {
 }
 
 export async function getScreenSize() {
+  if (useGnomeWayland) return gnomeWayland.getScreenSize();
   const { captureLib } = REMOTE_CONFIG.pipeline;
   if (captureLib === "robotjs") {
     return robotRef.getScreenSize();
@@ -59,6 +62,7 @@ export async function getScreenSize() {
 // When passed, capture uses it directly and skips the global cache so each
 // client can stream a different display concurrently.
 export async function captureFull(preferredMonitor = null) {
+  if (useGnomeWayland) return gnomeWayland.capture();
   const { captureLib, inputFormat } = REMOTE_CONFIG.pipeline;
 
   if (captureLib === "robotjs") {

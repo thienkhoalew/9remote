@@ -195,6 +195,7 @@ async function build() {
   await buildInstall();
   copyAssets();
   copyDesktopBridge();
+  fs.copyFileSync(path.join(SERVER_DIR, "features/remote/adapters/gnome-wayland.py"), path.join(DIST_DIR, "gnome-wayland.py"));
   copyMobileVendor();
   copyExtension();
 
