@@ -1,8 +1,8 @@
 import chalk from "chalk";
 
-// NODE_ENV=development only toggles local dev behavior (Vite proxy, logs) — the
+// NREMOTE_ENV=development only toggles local dev behavior (Vite proxy, logs) — the
 // target zone stays prod. Override with NREMOTE_WORKER_URL=https://dev.9remote.cc.
-const IS_DEV = process.env.NODE_ENV === "development";
+const IS_DEV = process.env.NREMOTE_ENV === "development";
 export const IS_DEV_ENV = IS_DEV;
 export const WORKER_URL = process.env.NREMOTE_WORKER_URL
   || (typeof __DEFAULT_WORKER_URL__ !== "undefined" ? __DEFAULT_WORKER_URL__ : "https://9remote.cc");
@@ -63,7 +63,6 @@ export const URL_SYNC_DEBOUNCE_MS = 5000;
 // wait for the final "offline" beat to flush before exiting anyway.
 export const SESSION_HEARTBEAT_INTERVAL_MS = 120000;
 // Agent beat on the DO relay; presence (SignalingDO.js) flags silence past ~3x this.
-export const SIGNALING_HB_INTERVAL_MS = 60000;
 export const HEARTBEAT_GOODBYE_MAX_MS = 1500;
 export const HEALTH_FLAP_STABLE_CHECKS = 2;
 export const FAST_PROBE_TIMEOUT_MS = 30000;

@@ -49,5 +49,17 @@ test("reset restores clean defaults", () => {
   assert.equal(state.carrier, "ws");
 });
 
+test("hostOffline flag: default off, set by verdict, cleared by reset", () => {
+  useConnectionStore.getState().reset();
+  assert.equal(useConnectionStore.getState().hostOffline, false);
+  useConnectionStore.getState().setHostOffline(true);
+  assert.equal(useConnectionStore.getState().hostOffline, true);
+  useConnectionStore.getState().setHostOffline(false);
+  assert.equal(useConnectionStore.getState().hostOffline, false);
+  useConnectionStore.getState().setHostOffline(true);
+  useConnectionStore.getState().reset();
+  assert.equal(useConnectionStore.getState().hostOffline, false, "reset must drop the offline verdict — it belongs to the dropped connection");
+});
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

@@ -8,10 +8,14 @@ import { useEffect, useRef, useState } from "react";
 import { useTiles } from "@/features/remote/hooks/useTiles";
 import { REMOTE_CONFIG } from "@/features/remote/constants/REMOTE_CONFIG";
 
-export function useBrowserFrame({ busRef, connected, targetId, onPainted }) {
-  const canvasRef = useRef(null);
+// canvasRef / frameRef may be injected (the pane shares them with the remote surface);
+// applyDimensions({width,height}, renderedTilesRef) lets that surface own canvas sizing.
+export function useBrowserFrame({ busRef, connected, targetId, onPainted, canvasRef: extCanvasRef, frameRef: extFrameRef, applyDimensions }) {
+  const ownCanvasRef = useRef(null);
+  const canvasRef = extCanvasRef || ownCanvasRef;
   const [frame, setFrame] = useState(null);
-  const frameRef = useRef(null);
+  const ownFrameRef = useRef(null);
+  const frameRef = extFrameRef || ownFrameRef;
   const onPaintedRef = useRef(onPainted);
   useEffect(() => { onPaintedRef.current = onPainted; }, [onPainted]);
 
@@ -58,19 +62,24 @@ export function useBrowserFrame({ busRef, connected, targetId, onPainted }) {
       if (stopped || dims?.targetId !== targetId || !dims.frameW || !dims.frameH) return;
       const prev = frameRef.current;
       const resized = !prev || prev.w !== dims.frameW || prev.h !== dims.frameH;
+      // A remounted canvas (pane reconnect) comes back at its default size.
+      const el = canvasRef.current;
+      const canvasStale = !!el && (el.width !== dims.frameW || el.height !== dims.frameH);
       const next = {
         w: dims.frameW,
         h: dims.frameH,
         meta: { ...(prev?.meta || {}), deviceWidth: dims.deviceWidth, deviceHeight: dims.deviceHeight }
       };
       frameRef.current = next;
-      if (!resized) return;
+      if (!resized && !canvasStale) return;
       // New grid: old hashes/tiles are meaningless. Resizing a canvas also clears it,
       // so ask for a full repaint right away (tiles may have beaten this message).
       cleanupTiles();
       handleScreenDimensions({ tileCount: dims.tileCount });
       setFrame(next);
-      if (canvasRef.current) {
+      if (applyDimensions) {
+        applyDimensions({ width: dims.frameW, height: dims.frameH }, renderedTilesRef);
+      } else if (canvasRef.current) {
         canvasRef.current.width = dims.frameW;
         canvasRef.current.height = dims.frameH;
       }
@@ -99,7 +108,7 @@ export function useBrowserFrame({ busRef, connected, targetId, onPainted }) {
       clearInterval(verifyInterval);
       cleanupTiles();
     };
-  }, [busRef, connected, targetId, cleanupTiles, handleTilesData, handleTilesBinaryV2, handleScreenDimensions, requestScreenWithHashes, renderedTilesRef]);
+  }, [busRef, connected, targetId, cleanupTiles, handleTilesData, handleTilesBinaryV2, handleScreenDimensions, requestScreenWithHashes, renderedTilesRef, canvasRef, frameRef, applyDimensions]);
 
   return {
     canvasRef,

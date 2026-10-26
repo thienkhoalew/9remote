@@ -18,7 +18,6 @@ hideDockIcon();
 initLogger();
 const logger = createLogger("server");
 import { startTransportServer, getIO } from "./transport/server.js";
-import { handlePreviewRequest } from "./features/fileExplorer/previewServer.js";
 import { initializeTerminal } from "./features/terminal/terminalSocket.js";
 import { matchesLocalKey } from "./cli/utils/apiKey.js";
 import { generateLocalToken } from "./lib/localToken.js";
@@ -52,7 +51,7 @@ import { loadSettings, loadKey } from "./cli/utils/state.js";
 import { REMOTE_CONFIG } from "./features/remote/REMOTE_CONFIG.js";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
-const IS_DEV = process.env.NODE_ENV === "development";
+const IS_DEV = process.env.NREMOTE_ENV === "development";
 const VITE_PORT = 5173;
 
 const UI_DIST = [
@@ -223,11 +222,6 @@ async function handleVerifyKey(req, res) {
   setTimeout(() => jsonOk(res, { ok: false, reason: result.reason }), result.penaltyMs || 0);
 }
 
-// HTML file preview — static serving of the file's directory behind a session id.
-function handlePreview(req, res, ctx) {
-  handlePreviewRequest(req, res, ctx);
-}
-
 // ────────────────────────────────────────────────────────────────────────────
 // ROUTE TABLE — single source of truth for all HTTP endpoints
 // public: true = accessible via tunnel, false/omit = localhost-only
@@ -245,7 +239,6 @@ const ROUTES = [
   }},
   { path: "/api/notify",           method: "POST", public: true, handler: handleNotifyPost },
   { path: "/api/notify",           method: "GET",  public: true, handler: handleNotifyGet },
-  { path: "/preview/*",            method: "GET",  public: true, handler: handlePreview },
 
   // UI state & SSE (localhost-only)
   { path: "/api/ui/events",        method: "GET",  handler: handleSseEvents },
@@ -508,7 +501,7 @@ export async function startServer() {
       if (io) { io.emit("server:shutdown"); io.close(() => logger.info("✓ Socket.IO closed")); }
       // Orphaned Chrome keeps the profile dir locked — the next boot's launch fails.
       // Dev: keep Chrome alive so the next nodemon boot adopts it (tabs/state intact).
-      if (process.env.NODE_ENV !== "development") {
+      if (process.env.NREMOTE_ENV !== "development") {
         try { await closeAllBrowsers(); } catch { /* best-effort */ }
       }
       await new Promise((r) => setTimeout(r, 500));

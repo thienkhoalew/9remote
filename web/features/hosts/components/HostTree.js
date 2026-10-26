@@ -367,9 +367,9 @@ export default function HostTree({
                   <BrowserTreeRow
                     busRef={busRef}
                     storeKey={rawId ?? "default"}
+                    workspaceId={rawId}
                     mobile={mobile}
                     rowCls={rowCls}
-                    activeWs={isActiveWs}
                     onSelectWorkspace={actions.selectWorkspace ? () => actions.selectWorkspace(rawId) : null}
                   />
                 )}
@@ -516,7 +516,7 @@ export default function HostTree({
 
 // The workspace's browser TABS as pseudo-session rows: same row shape as a
 // terminal session — profile-colored dot, profile avatar, session-font title.
-function BrowserTreeRow({ busRef, storeKey, mobile, rowCls, activeWs, onSelectWorkspace }) {
+function BrowserTreeRow({ busRef, storeKey, workspaceId, mobile, rowCls, onSelectWorkspace }) {
   const profile = useBrowserStore((s) => s.workspaceProfiles[storeKey] || "default");
   const tabs = useBrowserStore((s) => s.tabsByWorkspace[storeKey] ?? NO_TABS);
   const activeTabId = useBrowserStore((s) => s.activeByWorkspace[storeKey] || null);
@@ -525,10 +525,17 @@ function BrowserTreeRow({ busRef, storeKey, mobile, rowCls, activeWs, onSelectWo
     return Boolean(stack && stack[stack.length - 1]?.type === "browser");
   });
   const pushView = useTerminalStore((s) => s.pushView);
+  // Judge "active" from the live pick: the mobile list passes HostTree no active id.
+  const activeWs = useTerminalStore((s) => (s.activeWorkspaceId ?? null) === workspaceId);
+  const setActiveWorkspaceId = useTerminalStore((s) => s.setActiveWorkspaceId);
   if (!tabs.length) return null;
   const open = (targetId) => {
     vibrate();
-    if (!activeWs) onSelectWorkspace?.();
+    if (!activeWs) {
+      // No selection door (mobile list): aim the pane at this workspace directly.
+      if (onSelectWorkspace) onSelectWorkspace();
+      else setActiveWorkspaceId(workspaceId);
+    }
     useBrowserStore.getState().setActive(storeKey, targetId);
     pushView({ type: "browser" });
   };

@@ -120,7 +120,7 @@ export const AiAgentCard = memo(function AiAgentCard({
           {/* The sub-agent's own report is the only read of its work on this path */}
           {!isRunning && (output || error) && (
             <div className="mt-1 pl-3 border-l-2 border-border-subtle/60 font-mono text-[11px] max-h-[240px] overflow-y-auto select-text">
-              <div className={`whitespace-pre-wrap leading-relaxed ${isError ? "text-danger" : "text-text-muted"}`}>
+              <div className={`whitespace-pre-wrap wrap-anywhere leading-relaxed ${isError ? "text-danger" : "text-text-muted"}`}>
                 {typeof (error || output) === "string" ? error || output : JSON.stringify(error || output, null, 2)}
               </div>
             </div>

@@ -1,13 +1,20 @@
-// Static HTML preview — serves the HTML file's own directory over the agent HTTP
-// server so relative assets (css/js/img) resolve like a real website. Same trust
-// model as agent/proxy: an unguessable session id in the path is the only auth
-// (iframe subresources cannot carry headers), and sessions expire on their own.
+// Static HTML preview — serves the HTML file's own directory so relative assets
+// (css/js/img) resolve like a real website. The only consumer is the host's own
+// Chrome (remote browser pane), reached through a dedicated loopback-only
+// listener: a port of its own keeps the preview origin apart from the UI/API
+// server, so a previewed page can never pull same-origin tricks on /api/*.
+// Same trust model as agent/proxy: an unguessable session id in the path is the
+// only auth, and sessions expire on their own.
 
 import fs from "fs";
+import http from "http";
 import path from "path";
 import { randomUUID } from "crypto";
+import { createLogger } from "../../lib/logger.js";
 import { MIME_BY_EXT, PREVIEW_SESSION_TTL_MS, MAX_PREVIEW_SESSIONS, PREVIEW_NAV_SOURCE } from "./constants.js";
 import { isSensitivePath } from "./pathGuard.js";
+
+const log = createLogger("previewServer");
 
 // id → { root, realRoot, entry, expiresAt, timer }
 const sessions = new Map();
@@ -27,7 +34,8 @@ function touch(s) {
 
 // Mint a session for the directory holding filePath. Called over the authenticated
 // socket, so this is the trust boundary — sensitive paths are rejected here.
-export function startPreviewSession(filePath) {
+// localUrl names the loopback entry URL when the listener is up.
+export function startPreviewSession(filePath, loopbackPort = 0) {
   try {
     if (!filePath || typeof filePath !== "string") return { success: false, error: "File path required" };
     if (isSensitivePath(filePath)) return { success: false, error: "Access denied" };
@@ -45,7 +53,12 @@ export function startPreviewSession(filePath) {
     const s = { id, realRoot: root, entry: path.basename(filePath), expiresAt: 0, timer: null };
     sessions.set(id, s);
     touch(s);
-    return { success: true, sessionId: id, entry: s.entry };
+    return {
+      success: true,
+      sessionId: id,
+      entry: s.entry,
+      ...(loopbackPort ? { localUrl: `http://127.0.0.1:${loopbackPort}/preview/${id}/${encodeURIComponent(s.entry)}` } : {})
+    };
   } catch (error) {
     return { success: false, error: error.message };
   }
@@ -53,6 +66,30 @@ export function startPreviewSession(filePath) {
 
 export function endPreviewSession(sessionId) {
   if (sessionId) dropSession(sessionId);
+}
+
+// Loopback listener for the remote browser pane. Started lazily on the first
+// preview and kept for the host's lifetime; port 0 lets the OS pick, so it can
+// never collide with another service on the machine.
+let loopbackPromise = null; // resolves { port }
+
+function ensureLoopbackServer() {
+  if (!loopbackPromise) {
+    loopbackPromise = new Promise((resolve, reject) => {
+      const server = http.createServer((req, res) => {
+        handlePreviewRequest(req, res, { pathname: (req.url || "/").split("?")[0] });
+      });
+      // An unhandled 'error' after listen would crash the host — always keep a handler.
+      server.on("error", (e) => log.error(`Preview loopback server error: ${e.message}`));
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => {
+        resolve({ port: server.address().port });
+      });
+    });
+    // A failed listen must not poison every later preview — clear the memo to retry.
+    loopbackPromise.catch(() => { loopbackPromise = null; });
+  }
+  return loopbackPromise;
 }
 
 function endText(res, code, msg) {
@@ -122,7 +159,7 @@ function sendHtml(res, filePath) {
   res.end(buf);
 }
 
-// Route handler for /preview/:sessionId/* — registered public in agent/index.js.
+// Route handler for /preview/:sessionId/* — served by the loopback listener.
 export function handlePreviewRequest(req, res, { pathname }) {
   const match = pathname.match(/^\/preview\/([0-9a-f-]+)(\/.*)?$/);
   const s = match ? sessions.get(match[1]) : null;
@@ -152,8 +189,13 @@ export function handlePreviewRequest(req, res, { pathname }) {
 }
 
 export function setupPreviewHandlers(socket) {
-  socket.on("preview:start", ({ filePath }, callback) => {
-    callback?.(startPreviewSession(filePath));
+  socket.on("preview:start", async ({ filePath }, callback) => {
+    try {
+      const { port } = await ensureLoopbackServer();
+      callback?.(startPreviewSession(filePath, port));
+    } catch (error) {
+      callback?.({ success: false, error: error.message });
+    }
   });
   socket.on("preview:end", ({ sessionId }, callback) => {
     endPreviewSession(sessionId);

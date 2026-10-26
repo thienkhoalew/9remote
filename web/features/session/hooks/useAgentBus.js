@@ -36,6 +36,7 @@ export function useAgentBus() {
   // connection, and a re-key resets it there — not to the component.
   const approvalStatus = useConnectionStore((s) => s.approvalStatus);
   const admitted = useConnectionStore((s) => s.admitted);
+  const hostOffline = useConnectionStore((s) => s.hostOffline);
   const { getAuth } = useSessionStorage();
 
   // Unified handler for device approval arriving from either socket.io or DO signaling relay.
@@ -429,6 +430,7 @@ export function useAgentBus() {
     retryStatus,
     approvalStatus,
     admitted,
+    hostOffline,
     sessions,
     remoteAvailable,
     mobileAvailable,

@@ -5,7 +5,7 @@ import sharp from "sharp";
 import os from "node:os";
 import path from "node:path";
 
-import { clampViewport, snapRaster, cdpTouchPoints, frameAdmitted, hasActiveStreamFor, handleFrame, releaseAck, startStream, stopStream, compareRecordTileHashes } from "../features/browser/stream.js";
+import { clampViewport, snapRaster, cdpTouchPoints, cdpModifiers, keyEventParams, frameAdmitted, hasActiveStreamFor, handleFrame, releaseAck, startStream, stopStream, compareRecordTileHashes } from "../features/browser/stream.js";
 import { ANTI_DETECTION_SCRIPT, headlessOverride, identityOverride, mobileOverride, stripHeadlessUa } from "../features/browser/antiDetection.js";
 import { parseCookiesJson, parseNetscapeCookies } from "../features/browser/cookieImport.js";
 import { closeTab, createProfile, getOrLaunchBrowser, idleCloseDue, listProfiles, listTabs, normalizeUrlInput, openTab, peekBrowser, removeProfile, resolveChromeBinary, scoreHistory, sweepIdleBrowsers } from "../features/browser/browserEngine.js";
@@ -439,3 +439,22 @@ if (failed) {
   process.exit(1);
 }
 console.log(`${tests.length} passed`);
+
+test("cdpModifiers maps robotjs names to the CDP bitmask and ignores junk", () => {
+  assert.equal(cdpModifiers(["control", "shift"]), 10);
+  assert.equal(cdpModifiers(["command", "alt"]), 5);
+  assert.equal(cdpModifiers(["bogus", 7]), 0);
+  assert.equal(cdpModifiers(null), 0);
+});
+
+test("keyEventParams: chords carry editing commands, typed chars carry text", () => {
+  const copy = keyEventParams("c", ["control"]);
+  assert.deepEqual(copy.params.commands, ["copy"]);
+  assert.equal(copy.params.text, undefined);
+  assert.equal(copy.command, "copy");
+  assert.equal(keyEventParams("z", ["control", "shift"]).command, "redo");
+  assert.equal(keyEventParams("a", []).params.text, "a");
+  assert.equal(keyEventParams("F5", []).params.windowsVirtualKeyCode, 116);
+  assert.equal(keyEventParams("up", []).params.key, "ArrowUp");
+  assert.equal(keyEventParams("nope-key", []), null);
+});

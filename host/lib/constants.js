@@ -92,7 +92,7 @@ export async function hideDockIcon() {
 export const VITE_DEV_PORT = 5173;
 
 // Next dev server port (web UI in a dev checkout)
-export const WEB_DEV_PORT = 3000;
+export const WEB_DEV_PORT = 2200;
 
 // Reserved deviceId for the trusted local UI — never persisted/tracked as a client.
 export const LOCAL_UI_DEVICE_ID = "local-ui";
@@ -103,7 +103,7 @@ export const LOCAL_UI_DEVICE_ID = "local-ui";
 // the machine does not. These are ports, not a trust decision — the checks that
 // matter are the key TAIL and, for /api/ui/state, that the request arrived over
 // loopback with a local Host (see middleware/cors.js). Gating these on
-// NODE_ENV instead would make a production install reject its own dev UI.
+// NREMOTE_ENV instead would make a production install reject its own dev UI.
 export const LOCAL_UI_ORIGINS = [
   `http://localhost:${SERVER_PORT}`,
   `http://127.0.0.1:${SERVER_PORT}`,

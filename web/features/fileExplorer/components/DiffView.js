@@ -1,7 +1,7 @@
 "use client";
 
-import { useState, useEffect } from "react";
-import { parseRepoDiffPath, isImageFile } from "../constants/fileExplorer.js";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { parseRepoDiffPath, isImageFile, GIT_AUTO_REFRESH_EVENTS } from "../constants/fileExplorer.js";
 import { useI18n } from "@/shared/i18n";
 import DiffBody from "./DiffBody.js";
 import ImageDiffView from "./ImageDiffView.js";
@@ -16,22 +16,35 @@ export default function DiffView({ diffPath, workspace, fileBus, compact = false
   const [loading, setLoading] = useState(!isImage);
   const [diff, setDiff] = useState("");
   const [error, setError] = useState("");
+  // Only the latest request may write state, so a slow stale reply can't win.
+  const reqIdRef = useRef(0);
 
+  const load = useCallback(async () => {
+    const reqId = ++reqIdRef.current;
+    setLoading(true);
+    setError("");
+    const r = await fileBus.gitDiff?.(effectiveWorkspace, filePath, status);
+    if (reqId !== reqIdRef.current) return;
+    if (r?.success) setDiff(r.diff || "");
+    else setError(r?.error || "");
+    setLoading(false);
+  }, [fileBus, effectiveWorkspace, filePath, status]);
+
+  // Deferred a tick so the loading flag is not set synchronously inside the effect.
   useEffect(() => {
     if (isImage) return;
-    let cancelled = false;
-    // Deferred a tick so the loading flag is not set synchronously inside the effect.
-    const id = setTimeout(async () => {
-      setLoading(true);
-      setError("");
-      const r = await fileBus.gitDiff?.(effectiveWorkspace, filePath, status);
-      if (cancelled) return;
-      if (r?.success) setDiff(r.diff || "");
-      else setError(r?.error || "");
-      setLoading(false);
-    }, 0);
-    return () => { cancelled = true; clearTimeout(id); };
-  }, [effectiveWorkspace, filePath, status, fileBus, isImage]);
+    const id = setTimeout(load, 0);
+    return () => clearTimeout(id);
+  }, [load, isImage]);
+
+  // An already-open diff tab must not keep showing a stale diff: refetch on the same
+  // events the SCM list refreshes on.
+  useEffect(() => {
+    if (isImage) return;
+    const handler = () => load();
+    GIT_AUTO_REFRESH_EVENTS.forEach((ev) => window.addEventListener(ev, handler));
+    return () => GIT_AUTO_REFRESH_EVENTS.forEach((ev) => window.removeEventListener(ev, handler));
+  }, [load, isImage]);
 
   if (isImage) {
     return (

@@ -59,7 +59,7 @@ const PlanText = memo(function PlanText({ plan, explanation = "" }) {
         <ListChecks size={16} className="text-brand-500" />
         <span>Plan</span>
       </div>
-      <pre className="font-mono text-[11px] leading-relaxed whitespace-pre-wrap break-words pl-6 max-h-[320px] overflow-y-auto">
+      <pre className="font-mono text-[11px] leading-relaxed whitespace-pre-wrap wrap-anywhere pl-6 max-h-[320px] overflow-y-auto">
         {plan}
       </pre>
       {explanation && (

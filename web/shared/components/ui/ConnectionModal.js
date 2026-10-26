@@ -15,7 +15,7 @@ import { APPROVAL_STATUS, RETRY_MODAL_MIN_ATTEMPT } from "@/shared/constants/tra
  * @param {boolean} firstConnect - true until the page has connected once: retry
  *        attempts then are the connect itself, not a lost connection
  */
-export default function ConnectionModal({ retryStatus, approvalStatus, connected, onLogout, onRetryNow, suppress = false, firstConnect = false }) {
+export default function ConnectionModal({ retryStatus, approvalStatus, connected, hostOffline = false, onLogout, onRetryNow, suppress = false, firstConnect = false }) {
   const { t } = useI18n();
 
   // PWA resume grace — tab just became visible; WS/RTC are re-establishing.
@@ -26,7 +26,7 @@ export default function ConnectionModal({ retryStatus, approvalStatus, connected
   // and switching to the agent window to click it is exactly what triggers the
   // grace on the way back.
   const isApproval = approvalStatus === APPROVAL_STATUS.pending || approvalStatus === APPROVAL_STATUS.rejected;
-  if (suppress && !isApproval) return null;
+  if (suppress && !isApproval && !hostOffline) return null;
 
   const handleBackToLogin = () => {
     if (onLogout) {
@@ -90,6 +90,46 @@ export default function ConnectionModal({ retryStatus, approvalStatus, connected
               className="mt-6 w-full py-3 bg-brand-500 hover:bg-brand-600 text-white font-medium rounded-brand transition-all duration-150 ease-out active:scale-[0.98]"
             >
               {t("connection.backToLogin")}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // The Worker vouched the host process is down (503 agent-offline): a standing
+  // answer like approval — show it instead of the retry ladder, which would
+  // grind against a dead machine for minutes. Kept above the connected check:
+  // a zombie carrier verdict must not hide it.
+  if (hostOffline) {
+    return (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-[2px]">
+        <div className="card-elev p-6 max-w-sm w-full mx-4">
+          <div className="text-center">
+            <div className="w-16 h-16 mx-auto bg-surface-3 rounded-full flex items-center justify-center">
+              <svg className="w-8 h-8 text-text-muted" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M18.364 5.636a9 9 0 010 12.728m-12.728 0a9 9 0 010-12.728M5.056 5.056l13.888 13.888" />
+              </svg>
+            </div>
+            <h3 className="text-text text-lg font-semibold mt-4">
+              {t("connection.hostOfflineTitle")}
+            </h3>
+            <p className="text-text-muted mt-2">
+              {t("connection.hostOfflineDescription")}
+            </p>
+            {onRetryNow && (
+              <button
+                onClick={() => { vibrate(); onRetryNow(); }}
+                className="mt-6 w-full py-3 bg-brand-500 hover:bg-brand-600 text-white font-medium rounded-brand transition-all duration-150 ease-out active:scale-[.98]"
+              >
+                {t("connection.retry")}
+              </button>
+            )}
+            <button
+              onClick={() => { vibrate(); handleBackToLogin(); }}
+              className={`w-full py-3 bg-surface-2 hover:bg-surface-3 text-text font-medium rounded-brand transition-all duration-150 ease-out active:scale-[.98] ${onRetryNow ? "mt-2" : "mt-6"}`}
+            >
+              {t("connection.exit")}
             </button>
           </div>
         </div>

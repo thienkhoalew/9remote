@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
 import { stripHarnessWrapping, isInjectedTurn } from "../terminal/agentHistory.js";
-import { recoverFromClaudeTranscript, CLAUDE_SESSION_ID_RE } from "./claudeTranscript.js";
+import { recoverFromClaudeTranscript, recoverClaudeBundle, CLAUDE_SESSION_ID_RE } from "./claudeTranscript.js";
 import { codexItemEvents } from "./codexItems.js";
 import { opencodePartEvents, diffFor } from "./opencodePart.js";
 import { antigravityEditDiff, ANTIGRAVITY_PARAM_ALIASES, ANTIGRAVITY_HEADLESS_NOTE_RE } from "./adapters/antigravityAdapter.js";
@@ -633,4 +633,14 @@ const TRANSCRIPT_RECOVERERS = {
 
 export function recoverFromTranscript(engine, cwd, sessionId, leafOverride = null) {
   return TRANSCRIPT_RECOVERERS[engine]?.(cwd, sessionId, leafOverride) ?? null;
+}
+
+/**
+ * The log AND the session state from one read of the CLI's store. Only claude keeps
+ * state worth reading out of a transcript; every other engine answers with the log
+ * alone, which is all it ever had.
+ */
+export function recoverBundleFromTranscript(engine, cwd, sessionId, leafOverride = null) {
+  if (engine === "claude") return recoverClaudeBundle(cwd, sessionId, { leafOverride });
+  return { events: TRANSCRIPT_RECOVERERS[engine]?.(cwd, sessionId, leafOverride) ?? null, state: null };
 }

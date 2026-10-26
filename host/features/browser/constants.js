@@ -90,3 +90,14 @@ export const KEY_DEFINITIONS = {
   pagedown: { key: "PageDown", code: "PageDown", windowsVirtualKeyCode: 34 },
   space: { key: " ", code: "Space", windowsVirtualKeyCode: 32, text: " " }
 };
+for (let i = 1; i <= 12; i++) KEY_DEFINITIONS[`f${i}`] = { key: `F${i}`, code: `F${i}`, windowsVirtualKeyCode: 111 + i };
+KEY_DEFINITIONS.insert = { key: "Insert", code: "Insert", windowsVirtualKeyCode: 45 };
+
+// Remote-desktop (robotjs) key names → KEY_DEFINITIONS ids.
+export const KEY_ALIASES = { up: "arrowup", down: "arrowdown", left: "arrowleft", right: "arrowright", return: "enter", esc: "escape" };
+
+// CDP Input modifier bitmask.
+export const CDP_MODIFIER_BITS = { alt: 1, control: 2, ctrl: 2, command: 4, meta: 4, shift: 8 };
+// Chord letter → Chrome editing command (CDP does not run shortcuts by itself).
+export const EDIT_COMMANDS = { a: "selectAll", c: "copy", x: "cut", v: "paste", z: "undo", y: "redo" };
+export const STREAM_CLIPBOARD_MAX_CHARS = 20000;

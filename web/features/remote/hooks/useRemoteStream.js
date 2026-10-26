@@ -4,6 +4,7 @@ import { useState, useRef, useEffect } from "react";
 import { REMOTE_CONFIG } from "@/features/remote/constants/REMOTE_CONFIG";
 import { tileStatsFrom } from "@/features/remote/lib/tileBinaryHeader";
 import { debugLog } from "@/shared/utils/debugLog";
+import { useClipboardBadge } from "@/features/remote/hooks/useClipboardBadge";
 
 // Screen-stream lifecycle: host bus listeners, the (re)stream handshake, and the
 // keep-alive effects that guarantee a painted canvas (periodic hash sync, dimension
@@ -18,8 +19,7 @@ export function useRemoteStream({
   const [screenLocked, setScreenLocked] = useState(false);
   const [unlockReady, setUnlockReady] = useState(false);
   const [unlockResult, setUnlockResult] = useState(null); // {ok, reason} | null
-  const [clipboardText, setClipboardText] = useState("");
-  const [clipboardNew, setClipboardNew] = useState(false);
+  const clipboard = useClipboardBadge();
   const [monitors, setMonitors] = useState([]);
   const [activeMonitorIndex, setActiveMonitorIndex] = useState(0);
   const [cursorShape, setCursorShape] = useState(null);
@@ -108,14 +108,7 @@ export function useRemoteStream({
 
     // Host clipboard changed → stash text + badge. Host seeds baseline on attach
     // (covers empty clipboard), so every event here is a real change worth showing.
-    const onClipboardUpdate = ({ text, hash }) => {
-      setClipboardText((prev) => {
-        if (hash && hash === onClipboardUpdate._lastHash) return prev;
-        onClipboardUpdate._lastHash = hash || null;
-        return text || "";
-      });
-      setClipboardNew(true);
-    };
+    const onClipboardUpdate = ({ text, hash }) => clipboard.push(text, hash);
 
     // Multi-monitor list from host → drives the switcher UI.
     const onMonitors = ({ list, activeIndex }) => {
@@ -235,9 +228,7 @@ export function useRemoteStream({
     unlockReady,
     unlockResult,
     setUnlockResult,
-    clipboardText,
-    clipboardNew,
-    setClipboardNew,
+    clipboard,
     monitors,
     activeMonitorIndex,
     cursorShape

@@ -397,7 +397,15 @@ export class WsProtocol extends BaseProtocol {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ apiKey: this._auth.apiKey })
       });
-      if (!resp.ok) throw new Error("Failed");
+      if (!resp.ok) {
+        // A 503 agent-offline is the Worker vouching the host process is down —
+        // let the UI say offline instead of grinding the ladder silently.
+        if (resp.status === 503) {
+          const body = await resp.json().catch(() => ({}));
+          if (body?.error === "agent-offline") this._ctx?.onHostOffline?.();
+        }
+        throw new Error("Failed");
+      }
       const { tunnelUrl, localIp } = await resp.json();
       if (seq !== this._retrySeq) {
         termLog("switch", "ws retry ABORT (superseded mid-fetch)");

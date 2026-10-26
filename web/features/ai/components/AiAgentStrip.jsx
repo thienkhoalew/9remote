@@ -124,8 +124,8 @@ function Row({ icon, tag, items, messages, engine, now, onOpen }) {
   // this been going" is a question about the whole hand-off, not about its newest arrival.
   const oldest = items.reduce((a, r) => (r.startedAt && (!a?.startedAt || r.startedAt < a.startedAt) ? r : a), null);
   const elapsed = taskElapsedMs(oldest, now);
-  // The first row that can answer, not the first row: a scan-found task carries no
-  // `toolUseId`, so it has no card to look under and would answer for the whole group.
+  // The first row that can answer, not the first row: a row with nothing to say
+  // must not answer for the whole group.
   const active = items.map((r) => describeActivity(taskActivity(messages, r.toolUseId), engine)).find(Boolean);
 
   return (

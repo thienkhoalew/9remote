@@ -8,10 +8,8 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import {
   ChevronLeft,
   ChevronRight,
-  CornerDownLeft,
   ExternalLink,
   Globe,
-  Keyboard,
   Link2,
   Loader2,
   RotateCw,
@@ -29,7 +27,6 @@ import { useConnectionStore } from "@/shared/stores/connectionStore";
 import { isLocalLink, localStreamParams, STREAM_QUALITY_LOCAL } from "@/features/browser/lib/browserFrame";
 import { useBrowserInvoke } from "@/features/browser/hooks/useBrowserInvoke";
 import { useBrowserFrame } from "@/features/browser/hooks/useBrowserFrame";
-import { pinchDistance } from "@/features/browser/lib/pointerMap";
 import { nextStageLock, shouldRestartStream } from "@/features/browser/lib/stageLock";
 import BrowserInspectSheet from "./BrowserInspectSheet";
 import BrowserAnnotationsDrawer from "./BrowserAnnotationsDrawer";
@@ -42,6 +39,12 @@ import BrowserPopupWindow from "./BrowserPopupWindow";
 import BrowserPickModal from "./BrowserPickModal";
 import { resolveOmniboxInput } from "@/features/browser/lib/omnibox";
 import { ProfileAvatar } from "@/features/browser/lib/profileAvatar";
+import { useRemoteSurface } from "@/features/remote/hooks/useRemoteSurface";
+import { useClipboardBadge } from "@/features/remote/hooks/useClipboardBadge";
+import { useBrowserBus } from "@/features/browser/hooks/useBrowserBus";
+import RemoteShell from "@/features/remote/components/RemoteShell";
+import BrowserControls from "@/features/browser/components/BrowserControls";
+import { BROWSER_INPUT } from "@/features/browser/constants/BROWSER_INPUT";
 
 // Stable empty list: a selector returning a fresh [] every call makes
 // useSyncExternalStore re-render forever ("getSnapshot should be cached").
@@ -63,18 +66,10 @@ const VIEWPORT_PRESETS = [
   { label: "Tablet 768×1024", w: 768, h: 1024 },
   { label: "Desktop 1120×780", w: 1120, h: 780 }
 ];
-// Overlay controls sit inside the stage: their pointer events must not reach the stage's page-input handlers.
-const stopStagePointer = (e) => e.stopPropagation();
 // Floating mobile pill states (dark plate, so the icons stay white in both themes).
 const PILL_ON = "bg-white/15 text-white";
 const PILL_OFF = "text-white/60 hover:text-white";
-const SPECIAL_KEYS = {
-  Enter: "enter", Tab: "tab", Escape: "escape", Backspace: "backspace", Delete: "delete",
-  ArrowUp: "arrowup", ArrowDown: "arrowdown", ArrowLeft: "arrowleft", ArrowRight: "arrowright",
-  Home: "home", End: "end", PageUp: "pageup", PageDown: "pagedown"
-};
-
-export default function BrowserPane({ busRef, connected = false, onBack, profile = "default", onProfileChange, workspaceId = "default" }) {
+export default function BrowserPane({ busRef, connected = false, visible = true, onBack, profile = "default", onProfileChange, workspaceId = "default" }) {
   const { t } = useI18n();
   const invoke = useBrowserInvoke(busRef, profile);
   const wsKey = workspaceId || "default";
@@ -86,21 +81,6 @@ export default function BrowserPane({ busRef, connected = false, onBack, profile
   const isLocal = isLocalLink(useConnectionStore((s) => s.connectionMode));
 
   const [address, setAddress] = useState("");
-  const [textOpen, setTextOpen] = useState(false);
-  const [textDraft, setTextDraft] = useState("");
-  // Always-mounted sink for the strip input — the keyboard button focuses it
-  // synchronously inside the tap gesture (iOS blocks async focus).
-  const textInputRef = useRef(null);
-  const toggleTextStrip = () => {
-    vibrate();
-    if (textOpen) {
-      setTextOpen(false);
-      textInputRef.current?.blur();
-    } else {
-      setTextOpen(true);
-      textInputRef.current?.focus();
-    }
-  };
   const [restartTick, setRestartTick] = useState(0);
   // Adaptive quality: null = host default (85, or 95 while local). The pane
   // watches outgoing bytes and steps quality down when a 3s window exceeds
@@ -110,7 +90,8 @@ export default function BrowserPane({ busRef, connected = false, onBack, profile
   const qualityRef = useRef(quality);
   useEffect(() => { qualityRef.current = quality; }, [quality]);
   // Viewport preset override — null = follow the stage's own size.
-  const [viewportPreset, setViewportPreset] = useState(null);
+  const viewportPreset = useBrowserStore((s) => s.viewportByWorkspace[wsKey] ?? null);
+  const setViewportPreset = (vp) => useBrowserStore.getState().setViewportFor(wsKey, vp);
   const [vpMenu, setVpMenu] = useState(false);
 
   // Feature modes & panels. grabIntent mirrors orca: "copy" (grab) vs "annotate".
@@ -146,23 +127,37 @@ export default function BrowserPane({ busRef, connected = false, onBack, profile
   const pickDragRef = useRef(null);
   const streamedTargetIdRef = useRef(null);
 
-  const stageRef = useRef(null);
+  const overlayRef = useRef(null);
   const bytesWindowRef = useRef({ bytes: 0, mark: 0, applied: 0 });
   const addressRef = useRef(null);
-  const dragRef = useRef(null);
-  const moveTimerRef = useRef(null);
-  const longPressTimer = useRef(null);
-  const longPressFired = useRef(false);
   const hoverTimerRef = useRef(null);
-  const lastUpRef = useRef(null);
-  const touchStartRef = useRef(null);
-  const touchPoints = useRef(new Map());
-  const pinchRef = useRef(null);
   const suggestTimer = useRef(null);
   const navigatingRef = useRef(false);
 
   const activeTab = tabs.find((tb) => tb.id === activeTargetId) || tabs.find((tb) => tb.active) || tabs[0] || null;
   const watchedId = activeTab?.id || null;
+
+  // Remote Desktop's whole input stack, fed by an adapter that speaks browser:input.
+  // Per-render handlers live in handlersRef: the hooks below are created before them.
+  const frameRef = useRef(null);
+  const handlersRef = useRef({});
+  const clipboard = useClipboardBadge();
+  const emits = useBrowserBus({
+    busRef, connected, targetId: watchedId, profile, frameRef,
+    getCanvas: () => handlersRef.current.canvas?.(),
+    onSecondaryClick: (x, y) => handlersRef.current.openContextMenuAt?.(x, y),
+    onClipboard: (text) => clipboard.push(text)
+  });
+  const stageLockRef = useRef(null);
+  const surface = useRemoteSurface({
+    emits, streaming: emits.streaming,
+    storagePrefix: "remoteBrowser", defaultPointerMode: "direct", hoverMove: true, wheelMultiplier: BROWSER_INPUT.wheelMultiplier,
+    stageLockRef,
+    intercept: (e, type) => handlersRef.current.intercept?.(e, type),
+    interceptKey: (e) => handlersRef.current.interceptKey?.(e)
+  });
+  const imgRef = surface.canvasRef;
+  const stageRef = surface.canvasContainerRef;
 
   // Popup rendering is responsive: mobile switches the whole pane to the popup
   // tab (handled in useBrowserTabs); desktop floats it over the parent stream.
@@ -178,16 +173,6 @@ export default function BrowserPane({ busRef, connected = false, onBack, profile
     ? tabs.find((t) => t.openerId === watchedId && t.id !== watchedId) || null
     : null;
 
-  // Popup gone → the parent stream restarts: the popup's stream start had
-  // fronted ITS tab, and without a restart the parent keeps streaming a
-  // background tab (stalled). A restart re-fronts it on the host side.
-  const prevPopupIdRef = useRef(null);
-  useEffect(() => {
-    const had = prevPopupIdRef.current;
-    prevPopupIdRef.current = popupTab?.id || null;
-    if (had && had !== popupTab?.id) setRestartTick((n) => n + 1);
-  }, [popupTab?.id]);
-
   const [prevWatched, setPrevWatched] = useState(null);
   if (prevWatched !== watchedId) {
     setPrevWatched(watchedId);
@@ -202,9 +187,16 @@ export default function BrowserPane({ busRef, connected = false, onBack, profile
   }, [tabUrl]);
 
   // Screencast stream lifecycle
+  const visibleRef = useRef(visible);
+  useEffect(() => { visibleRef.current = visible; }, [visible]);
   useEffect(() => {
     const bus = busRef?.current;
-    if (!connected || !bus?.emit || !watchedId) return;
+    if (!connected || !visible || !bus?.emit || !watchedId) return;
+    // While a popup floats, its stream must be the ONLY one on this connection:
+    // tiles carry no target id on the wire, so two live streams would paint both
+    // canvases over each other (and Chrome only screencasts the front tab
+    // anyway). Popup gone → this dep flips and the parent stream restarts.
+    if (popupTab?.id) return;
     let stopped = false;
     const rect = stageRef.current?.getBoundingClientRect();
     // A failed start leaves the pane input-dead (every browser:input throws
@@ -227,6 +219,7 @@ export default function BrowserPane({ busRef, connected = false, onBack, profile
         quality: qualityRef.current || boost.quality
       };
       bus.emit("browser:stream.start", params, (res) => {
+        if (stopped) return; // a newer run owns the stream — this ack is stale
         // Host healed a stale tab id to the profile's live tab — follow it so
         // the pane streams and inputs target the same tab.
         if (res?.ok && res.targetId) {
@@ -247,13 +240,23 @@ export default function BrowserPane({ busRef, connected = false, onBack, profile
       const toStop = streamedTargetIdRef.current || currentStartedId || watchedId;
       bus.emit("browser:stream.stop", { targetId: toStop });
     };
-  }, [busRef, connected, watchedId, restartTick, viewportPreset, profile, isLocal, setActive, wsKey]);
+  }, [busRef, connected, visible, watchedId, restartTick, viewportPreset, profile, isLocal, setActive, wsKey, popupTab?.id]);
+
+  // Re-show after display:none: the flip fires no resize event and a hidden
+  // resize was ignored, so re-apply the canvas fit here or scale(0) blanks the stage.
+  useEffect(() => {
+    if (!visible) return;
+    const d = surface.serverDimensionsRef.current;
+    if (d?.width) surface.handleCanvasDimensions(d);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visible]);
 
   // Binary frames arrive on the file lane — reassembled, decoded off-thread
   // and painted to the canvas by the hook; the pane only tracks paint events
   // (loading UX + the adaptive-bytes watchdog).
-  const { canvasRef: imgRef, frame, frameRef } = useBrowserFrame({
+  const { frame } = useBrowserFrame({
     busRef, connected, targetId: watchedId,
+    canvasRef: imgRef, frameRef, applyDimensions: surface.handleCanvasDimensions,
     onPainted: (meta, bytes) => {
       bytesWindowRef.current.bytes += bytes;
       setLoading(false); // any frame after a navigate = the page painted
@@ -290,7 +293,7 @@ export default function BrowserPane({ busRef, connected = false, onBack, profile
   // minimized) → stop the screencast; back → restart with the cached frame.
   useEffect(() => {
     const onVisibility = () => {
-      if (document.hidden) {
+      if (document.hidden || !visibleRef.current) {
         busRef?.current?.emit?.("browser:stream.stop", { targetId: watchedId });
       } else {
         setRestartTick((n) => n + 1);
@@ -303,8 +306,8 @@ export default function BrowserPane({ busRef, connected = false, onBack, profile
   // Chrome cold start costs seconds — boot the profile's browser the moment
   // the pane opens, not when the first URL is typed. Fire-and-forget.
   useEffect(() => {
-    if (connected) invoke("warm");
-  }, [connected, invoke]);
+    if (connected && visible) invoke("warm");
+  }, [connected, visible, invoke]);
 
   // New-tab page: a blank tab lists the host's running dev servers.
   const blankTab = !activeTab?.url || /^about:blank$/.test(activeTab.url || "");
@@ -320,10 +323,7 @@ export default function BrowserPane({ busRef, connected = false, onBack, profile
 
   // Timers own input timing — never let one fire into an unmounted pane.
   useEffect(() => () => {
-    if (wheelRef.current?.timer) clearTimeout(wheelRef.current.timer);
-    if (longPressTimer.current) clearTimeout(longPressTimer.current);
     if (suggestTimer.current) clearTimeout(suggestTimer.current);
-    if (moveTimerRef.current) clearTimeout(moveTimerRef.current);
     if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
   }, []);
 
@@ -341,17 +341,8 @@ export default function BrowserPane({ busRef, connected = false, onBack, profile
     };
   }, [busRef, watchedId]);
 
-  const sendInput = useCallback((events) => {
-    if (!watchedId || !events.length) return;
-    busRef?.current?.emit?.("browser:input", {
-      targetId: watchedId,
-      events,
-      profile
-    });
-  }, [busRef, watchedId, profile]);
-
-  // Pixel-perfect mapping: the img shrink-fits the stage, so its rect is the
-  // drawn frame; scale through the ratio into the page's own device pixels.
+  // The canvas is CSS-scaled/panned, so its bounding rect IS the drawn frame:
+  // client px <-> page CSS px map through that ratio, zoomed or not.
   const pagePoint = useCallback((clientX, clientY) => {
     const el = imgRef.current;
     const meta = frameRef.current?.meta;
@@ -366,16 +357,17 @@ export default function BrowserPane({ busRef, connected = false, onBack, profile
   }, [imgRef, frameRef]);
   const point = useCallback((e) => pagePoint(e.clientX, e.clientY), [pagePoint]);
 
-  // Drawn-frame box (stage-relative): rings and the sweep rect position against
-  // it, so they follow the shrink-fit image on any stage resize.
+  // Drawn-frame box (overlay-relative): rings and the sweep rect position against it,
+  // so they follow resize, zoom and pan of the canvas.
   const hasFrame = !!frame;
+  const { canvasZoom, canvasPan, fitScale } = surface;
   useLayoutEffect(() => {
     const update = () => {
       const img = imgRef.current;
-      const stage = stageRef.current;
-      if (!img || !stage) return setImgBox(null);
+      const box = overlayRef.current;
+      if (!img || !box) return setImgBox(null);
       const ir = img.getBoundingClientRect();
-      const sr = stage.getBoundingClientRect();
+      const sr = box.getBoundingClientRect();
       if (!ir.width || !ir.height) return setImgBox(null);
       const next = { left: ir.left - sr.left, top: ir.top - sr.top, width: ir.width, height: ir.height };
       setImgBox((prev) => (prev
@@ -385,58 +377,35 @@ export default function BrowserPane({ busRef, connected = false, onBack, profile
     };
     update();
     const ro = new ResizeObserver(update);
-    if (stageRef.current) ro.observe(stageRef.current);
+    if (overlayRef.current) ro.observe(overlayRef.current);
     if (imgRef.current) ro.observe(imgRef.current);
     return () => ro.disconnect();
-  }, [hasFrame, imgRef]);
+  }, [hasFrame, imgRef, connected, canvasZoom, canvasPan.x, canvasPan.y, fitScale]);
 
-  // Wheel coalescing: CDP mouseWheel costs 18-45ms host-side, so one-message-
-  // per-event saturates the serial input queue (measured). 50ms keeps ~20
-  // dispatches/s while deltas arrive in order (host serializes).
-  const wheelRef = useRef(null);
-  const stageSizeRef = useRef(null);
-  // Soft-KB lock (mobile, TerminalPane pattern): the keyboard shrinks the
-  // viewport, not the page — the stage keeps its keyboard-closed height (canvas
-  // stays full-size, pane scrolls instead) and restart decisions compare TRUE
-  // sizes only, so a keyboard cycle never restarts the screencast.
-  // ponytail: stage keeps touch-none while locked — drag the topbar/strip to
-  // scroll the pane; give the stage pan-y + input gating if that's not enough.
-  const paneRootRef = useRef(null);
-  const [stageLockH, setStageLockH] = useState(null);
-  const lockRef = useRef(null);
-  const stageFreeHRef = useRef(0);
-  const isMobileRef = useRef(isMobile);
+  // The stream is sized to the canvas container: a real resize restarts it, but a soft
+  // keyboard (or the Aa panel it opens) shrinks the container without changing the page
+  // the user is looking at — nextStageLock keeps those out of the restart decision.
+  const isMobileRef = useRef(false);
   useEffect(() => { isMobileRef.current = isMobile; }, [isMobile]);
+  const stageSizeRef = useRef(null);
+  const recalculateDisplaySize = surface.recalculateDisplaySize;
   useEffect(() => {
-    const root = paneRootRef.current;
-    const stage = stageRef.current;
-    if (!root || !stage) return;
+    const el = stageRef.current;
+    if (!el) return;
     let timer = null;
-    // Root = viewport-driven (keyboard), stage = content-driven (strip open):
-    // watching both keeps the true size honest through both kinds of change.
     const ro = new ResizeObserver(() => {
-      const size = { w: Math.round(root.clientWidth), h: Math.round(root.clientHeight) };
+      if (!visibleRef.current) return; // display:none reports 0×0
+      const size = { w: Math.round(el.clientWidth), h: Math.round(el.clientHeight) };
+      if (!size.w || !size.h) return;
+      const wasShrunk = stageLockRef.current?.kbShrunk;
       const lock = isMobileRef.current
-        ? nextStageLock(lockRef.current, size)
-        : { width: size.w, height: size.h, lockedH: null, kbShrunk: false };
-      const wasShrunk = lockRef.current?.kbShrunk;
-      lockRef.current = lock;
-      // Free height only updates while unlocked — on the shrink event the stage
-      // has already collapsed, so the pre-shrink value is the one to keep.
-      if (!lock.kbShrunk) stageFreeHRef.current = Math.round(stage.getBoundingClientRect().height);
-      setStageLockH(lock.kbShrunk ? stageFreeHRef.current : null);
-      // Focus below the fold (text strip) stays visible: scroll it in once when
-      // the keyboard opens — the fixed html doesn't do it by itself.
-      if (lock.kbShrunk && !wasShrunk) {
-        const el = document.activeElement;
-        if (root.contains(el)) {
-          requestAnimationFrame(() => {
-            const past = el.getBoundingClientRect().bottom - root.getBoundingClientRect().bottom;
-            if (past > 0) root.scrollTop += past;
-          });
-        }
+        ? nextStageLock(stageLockRef.current, size)
+        : { width: size.w, height: size.h, kbShrunk: false };
+      stageLockRef.current = lock;
+      if (lock.kbShrunk !== wasShrunk) {
+        recalculateDisplaySize?.();
       }
-      const trueSize = { w: size.w, h: stageFreeHRef.current || size.h };
+      const trueSize = { w: size.w, h: lock.kbShrunk ? lock.height : size.h };
       const last = stageSizeRef.current;
       stageSizeRef.current = trueSize;
       if (!last) return;
@@ -445,13 +414,12 @@ export default function BrowserPane({ busRef, connected = false, onBack, profile
         if (shouldRestartStream(last, trueSize)) setRestartTick((n) => n + 1);
       }, 300);
     });
-    ro.observe(root);
-    ro.observe(stage);
+    ro.observe(el);
     return () => {
       clearTimeout(timer);
       ro.disconnect();
     };
-  }, []);
+  }, [connected, stageRef, recalculateDisplaySize]);
 
   const pickKey = (el) => el?.selector || el?.tag || "element";
   const addPicked = (els) => {
@@ -491,31 +459,30 @@ export default function BrowserPane({ busRef, connected = false, onBack, profile
     };
   }, [connected, watchedId, invoke]);
 
-  const openContextMenu = async (clientX, clientY) => {
-    const p = pagePoint(clientX, clientY);
-    const res = await invoke("inspect", { targetId: watchedId, x: p.x, y: p.y });
-    setCtxMenu({ x: clientX, y: clientY, element: res?.ok ? res.element : null });
+  const openContextMenuAt = async (px, py) => {
+    const el = imgRef.current;
+    const meta = frameRef.current?.meta;
+    const rect = el?.getBoundingClientRect();
+    const vW = meta?.deviceWidth || rect?.width || 1;
+    const vH = meta?.deviceHeight || rect?.height || 1;
+    const at = rect ? { x: rect.left + (px / vW) * rect.width, y: rect.top + (py / vH) * rect.height } : { x: 0, y: 0 };
+    const res = await invoke("inspect", { targetId: watchedId, x: px, y: py });
+    setCtxMenu({ x: at.x, y: at.y, element: res?.ok ? res.element : null });
   };
 
-  const clearLongPress = () => {
-    if (longPressTimer.current) {
-      clearTimeout(longPressTimer.current);
-      longPressTimer.current = null;
-    }
-  };
-
-  const onPointerDown = (e) => {
-    if (!frameRef.current || e.button > 2) return;
-    vibrate();
-    // Pick mode + mouse: down records the sweep start — resolves on up.
-    // Touch keeps its NATIVE path (scrolling stays live): the page only hears
-    // the finger once it drags past the slop, and a still tap picks on release.
-    if (grabIntent === "pick" && e.pointerType !== "touch") {
-      pickDragRef.current = { sx: e.clientX, sy: e.clientY, moved: false };
-      return;
-    }
-    // Annotate mode: the tap picks an element instead of clicking.
-    if (grabIntent && grabIntent !== "pick") {
+  // Pick / annotate modes claim the canvas pointer events (pick = tap one, drag = sweep);
+  // otherwise nothing is intercepted and the remote-desktop input pipeline drives the page.
+  const interceptPointer = (e, type) => {
+    if (!grabIntent) return false;
+    if (type === "wheel" || type === "contextmenu") return false;
+    if (type.startsWith("touch") || type === "dblclick" || e.button > 2) return true;
+    if (type === "pointerdown") {
+      vibrate();
+      if (grabIntent === "pick") {
+        pickDragRef.current = { sx: e.clientX, sy: e.clientY, moved: false };
+        return true;
+      }
+      // Annotate mode: the tap picks an element instead of clicking.
       const gp = point(e);
       const at = { x: e.clientX, y: e.clientY };
       invoke("inspect", { targetId: watchedId, x: gp.x, y: gp.y }).then((res) => {
@@ -527,47 +494,15 @@ export default function BrowserPane({ busRef, connected = false, onBack, profile
           setInspectedElement(res.element);
         }
       });
-      return;
+      return true;
     }
-    if (e.pointerType === "touch") {
-      touchPoints.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
-      // Second finger: end the touch stream, switch to pinch-zoom mode.
-      if (touchPoints.current.size === 2) {
-        clearLongPress();
-        longPressFired.current = true; // the pending touchend for finger 1 is skipped
-        sendInput([{ t: "touch", type: "end" }]);
-        pinchRef.current = { dist: pinchDistance(touchPoints.current) };
-        return;
-      }
-      clearLongPress();
-      longPressFired.current = false;
-      const p = point(e);
-      touchStartRef.current = { x: e.clientX, y: e.clientY, page: p, streaming: grabIntent !== "pick" };
-      if (grabIntent === "pick") return;
-      sendInput([{ t: "touch", type: "start", points: [p] }]);
-      longPressTimer.current = setTimeout(() => {
-        longPressTimer.current = null;
-        longPressFired.current = true;
-        sendInput([{ t: "touch", type: "end" }]);
-        const hit = touchPoints.current.values().next().value;
-        if (hit) openContextMenu(hit.x, hit.y);
-      }, 550);
-      return;
-    }
-    // Mouse: plain press — release on up, double-click detected there too.
-    dragRef.current = { sx: e.clientX, sy: e.clientY, moved: false };
-    const p = point(e);
-    sendInput([{ t: "pointer", type: "press", x: p.x, y: p.y, button: e.button === 2 ? "right" : e.button === 1 ? "middle" : "left" }]);
-  };
-
-  const onPointerMove = (e) => {
-    // Pick sweep: track the drag, show the rubber band once it leaves the tap slop.
-    if (grabIntent === "pick" && pickDragRef.current) {
+    if (type === "pointermove") {
+      if (grabIntent !== "pick") return true;
       const d = pickDragRef.current;
-      if (!d.moved && Math.abs(e.clientX - d.sx) + Math.abs(e.clientY - d.sy) > 8) d.moved = true;
-      if (d.moved) {
-        const sb = stageRef.current?.getBoundingClientRect();
-        if (sb) {
+      if (d) {
+        if (!d.moved && Math.abs(e.clientX - d.sx) + Math.abs(e.clientY - d.sy) > 8) d.moved = true;
+        const sb = overlayRef.current?.getBoundingClientRect();
+        if (d.moved && sb) {
           setRubber({
             left: Math.min(d.sx, e.clientX) - sb.left,
             top: Math.min(d.sy, e.clientY) - sb.top,
@@ -575,89 +510,30 @@ export default function BrowserPane({ busRef, connected = false, onBack, profile
             height: Math.abs(e.clientY - d.sy)
           });
         }
+        return true;
       }
-      return;
-    }
-    if (e.pointerType === "touch") {
-      if (!touchPoints.current.has(e.pointerId)) return;
-      touchPoints.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
-      // Pinch: two fingers → ctrl+wheel (Chrome's native page zoom), throttled.
-      if (pinchRef.current && touchPoints.current.size >= 2) {
-        const dist = pinchDistance(touchPoints.current);
-        const delta = pinchRef.current.dist - dist;
-        pinchRef.current.dist = dist;
-        if (Math.abs(delta) > 1 && !pinchRef.current.timer) {
-          const [a, b] = [...touchPoints.current.values()];
-          const mid = pagePoint((a.x + b.x) / 2, (a.y + b.y) / 2);
-          pinchRef.current.timer = setTimeout(() => {
-            if (pinchRef.current) pinchRef.current.timer = null;
-          }, 40);
-          sendInput([{ t: "wheel", x: mid.x, y: mid.y, deltaX: 0, deltaY: Math.round(delta * 4), ctrlKey: true }]);
-        }
-        return;
-      }
-      // Single-finger drag → native touch scroll (coalesced per frame window).
-      const st = touchStartRef.current;
-      const dragged = st && Math.abs(e.clientX - st.x) + Math.abs(e.clientY - st.y) > 10;
-      if (dragged) clearLongPress();
-      if (st && !st.streaming) {
-        if (!dragged) return;
-        st.streaming = true;
-        sendInput([{ t: "touch", type: "start", points: [st.page] }]);
-      }
-      const p = point(e);
-      sendInput([{ t: "touch", type: "move", points: [p] }]);
-      return;
-    }
-    // Mouse drag with button down.
-    if (dragRef.current && frameRef.current) {
-      const d = dragRef.current;
-      if (Math.abs(e.clientX - d.sx) + Math.abs(e.clientY - d.sy) > 8) {
-        d.moved = true;
-        clearLongPress();
-      }
-      if (d.moved && !moveTimerRef.current) {
-        const ev = e;
-        moveTimerRef.current = setTimeout(() => {
-          moveTimerRef.current = null;
-          const p = point(ev);
-          sendInput([{ t: "pointer", type: "move", x: p.x, y: p.y, drag: true }]);
-        }, 30);
-      }
-      return;
-    }
-    // Mouse hover (no button): drives :hover states and the cursor probe.
-    if (!frameRef.current) return;
-    if (hoverTimerRef.current) return;
-    const ev = e;
-    hoverTimerRef.current = setTimeout(() => {
-      hoverTimerRef.current = null;
-      const p = point(ev);
-      if (grabIntent === "pick") {
-        // Pick mode: highlight the element under the cursor instead of driving
-        // the page's own :hover — the pane glows what a click would collect.
+      if (hoverTimerRef.current) return true;
+      const ev = { clientX: e.clientX, clientY: e.clientY };
+      hoverTimerRef.current = setTimeout(() => {
+        hoverTimerRef.current = null;
+        const p = point(ev);
+        // Highlight the element under the cursor instead of driving the page's :hover.
         invoke("inspect", { targetId: watchedId, x: p.x, y: p.y }).then((res) => {
           const r = res?.ok && res.element ? res.element.rect : null;
           if (!r || !r.width) return setHoverRect(null);
-          // Containers wrapping most of the page read as "highlighting
-          // everything" — only glow reasonably-sized elements (< ~60% of the
-          // viewport area, like DevTools' practical pick).
+          // Containers wrapping most of the page read as "highlighting everything" —
+          // only glow reasonably-sized elements (< ~60% of the viewport area).
           const meta = frameRef.current?.meta || {};
           const vW = meta.deviceWidth || 0;
           const vH = meta.deviceHeight || 0;
           const tooBig = vW && vH && (r.width * r.height) / (vW * vH) > 0.6;
           setHoverRect(tooBig ? null : r);
         });
-        return;
-      }
-      if (!grabIntent) sendInput([{ t: "pointer", type: "move", x: p.x, y: p.y }]);
-    }, 80);
-  };
-
-  const onPointerUp = (e) => {
-    // Pick resolves here: a tap inspects one element (toggle), a sweep collects
-    // everything inside the dragged rectangle.
-    if (grabIntent === "pick" && pickDragRef.current) {
+      }, 80);
+      return true;
+    }
+    if (type === "pointerup" && grabIntent === "pick" && pickDragRef.current) {
+      // A tap inspects one element (toggle), a sweep collects everything inside.
       const d = pickDragRef.current;
       pickDragRef.current = null;
       setRubber(null);
@@ -679,104 +555,39 @@ export default function BrowserPane({ busRef, connected = false, onBack, profile
           if (res?.ok && res.element) togglePicked(res.element);
         });
       }
-      return;
     }
-    if (e.pointerType === "touch") {
-      touchPoints.current.delete(e.pointerId);
-      if (touchPoints.current.size < 2 && pinchRef.current) {
-        if (pinchRef.current.timer) clearTimeout(pinchRef.current.timer);
-        pinchRef.current = null;
-      }
-      clearLongPress();
-      // The long-press timer (or pinch entry) already ended the touch stream.
-      if (!longPressFired.current && !pinchRef.current) {
-        const st = touchStartRef.current;
-        if (!st || st.streaming) sendInput([{ t: "touch", type: "end" }]);
-        // Pick mode tap (finger never dragged): toggle the element under it,
-        // exactly like a mouse click — scrolling stays a first-class gesture.
-        else if (grabIntent === "pick" && e.type !== "pointercancel") {
-          const gp = pagePoint(e.clientX, e.clientY);
-          invoke("inspect", { targetId: watchedId, x: gp.x, y: gp.y }).then((res) => {
-            if (res?.ok && res.element) togglePicked(res.element);
-          });
-        }
-      }
-      touchStartRef.current = null;
-      longPressFired.current = false;
-      return;
-    }
-    clearLongPress();
-    if (grabIntent || !dragRef.current || !frameRef.current) return;
-    dragRef.current = null;
-    const p = point(e);
-    const button = e.button === 2 ? "right" : e.button === 1 ? "middle" : "left";
-    // Double-click: same spot within 350ms → clickCount 2 (text select, word select).
-    const now = Date.now();
-    const last = lastUpRef.current;
-    lastUpRef.current = { t: now, x: e.clientX, y: e.clientY };
-    const isDouble = last && now - last.t < 350 &&
-      Math.abs(e.clientX - last.x) + Math.abs(e.clientY - last.y) < 20;
-    if (isDouble) {
-      lastUpRef.current = null;
-      sendInput([
-        { t: "pointer", type: "press", x: p.x, y: p.y, button, clickCount: 2 },
-        { t: "pointer", type: "release", x: p.x, y: p.y, button, clickCount: 2 }
-      ]);
-      return;
-    }
-    sendInput([{ t: "pointer", type: "release", x: p.x, y: p.y, button }]);
+    return true;
   };
 
-  useEffect(() => {
-    const el = stageRef.current;
-    if (!el || !watchedId) return;
-    const onWheel = (e) => {
-      if (!frameRef.current) return;
-      e.preventDefault();
-      const p = pagePoint(e.clientX, e.clientY);
-      const acc = wheelRef.current || (wheelRef.current = { x: p.x, y: p.y, deltaX: 0, deltaY: 0, ctrlKey: false });
-      acc.x = p.x; acc.y = p.y;
-      acc.deltaX += e.deltaX;
-      acc.deltaY += e.deltaY;
-      acc.ctrlKey = acc.ctrlKey || e.ctrlKey;
-      if (acc.timer) return;
-      acc.timer = setTimeout(() => {
-        acc.timer = null;
-        sendInput([{ t: "wheel", x: acc.x, y: acc.y, deltaX: acc.deltaX, deltaY: acc.deltaY, ctrlKey: acc.ctrlKey }]);
-        acc.deltaX = 0; acc.deltaY = 0; acc.ctrlKey = false;
-      }, 50);
-    };
-    el.addEventListener("wheel", onWheel, { passive: false });
-    return () => el.removeEventListener("wheel", onWheel);
-  }, [watchedId, grabIntent, sendInput, pagePoint, frameRef]);
-
-  const onKeyDown = (e) => {
-    // Orca chords: Mod+L focuses the address bar; Escape disarms grab/annotate.
+  // Orca chords: Mod+L focuses the address bar; Escape disarms pick/annotate.
+  const interceptKeyDown = (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "l") {
       e.preventDefault();
       addressRef.current?.focus();
-      return;
+      return true;
     }
     if (e.key === "Escape" && grabIntent) {
       setGrabIntent(null);
-      return;
+      return true;
     }
-    if (!frameRef.current || grabIntent || e.ctrlKey || e.metaKey || e.altKey) return;
-    const special = SPECIAL_KEYS[e.key];
-    if (special) {
-      e.preventDefault();
-      sendInput([{ t: "key", key: special }]);
-    } else if (e.key.length === 1) {
-      e.preventDefault();
-      sendInput([{ t: "text", text: e.key }]);
-    }
+    return !!grabIntent;
   };
 
-  const sendText = () => {
-    if (!textDraft) return;
-    sendInput([{ t: "text", text: textDraft }]);
-    setTextDraft("");
-  };
+  useEffect(() => {
+    handlersRef.current = {
+      canvas: () => imgRef.current,
+      openContextMenuAt,
+      intercept: interceptPointer,
+      interceptKey: interceptKeyDown
+    };
+  });
+
+  // A drag released outside the canvas must not leave the sweep band hanging.
+  useEffect(() => {
+    const clear = () => { pickDragRef.current = null; setRubber(null); };
+    window.addEventListener("pointerup", clear);
+    return () => window.removeEventListener("pointerup", clear);
+  }, []);
 
   const navigate = async (urlOverride) => {
     // Chrome-style omnibox: a bare host gains https://, anything else searches.
@@ -805,7 +616,7 @@ export default function BrowserPane({ busRef, connected = false, onBack, profile
       }
       const res = goLive
         ? await invoke("go", { targetId: watchedId, url })
-        : await invoke("open", { url });
+        : await invoke("open", { url, workspaceId: wsKey });
       setLoading(false);
       if (bootId) {
         const st = useBrowserStore.getState();
@@ -923,6 +734,7 @@ export default function BrowserPane({ busRef, connected = false, onBack, profile
     return (
     <>
       <button
+        onPointerDown={(e) => e.preventDefault()}
         onClick={() => { vibrate(); setGrabIntent((g) => (g === "pick" ? null : "pick")); setInspectedElement(null); setHoverRect(null); }}
         disabled={!frame}
         aria-label={t("sites.browserPanePickTitle")}
@@ -936,6 +748,7 @@ export default function BrowserPane({ busRef, connected = false, onBack, profile
       </button>
       <div className="relative">
         <button
+          onPointerDown={(e) => e.preventDefault()}
           onClick={() => { vibrate(); setVpMenu((v) => !v); }}
           aria-label={t("sites.browserPaneDeviceTitle")}
           className={`${toolBtn} shrink-0 flex items-center text-xs font-medium transition-colors ${
@@ -953,6 +766,7 @@ export default function BrowserPane({ busRef, connected = false, onBack, profile
               {VIEWPORT_PRESETS.map((opt) => (
                 <button
                   key={opt.label}
+                  onPointerDown={(e) => e.preventDefault()}
                   onClick={() => {
                     vibrate();
                     setViewportPreset(opt.w ? { width: opt.w, height: opt.h, mobile: !!opt.mobile } : null);
@@ -977,10 +791,7 @@ export default function BrowserPane({ busRef, connected = false, onBack, profile
   };
 
   return (
-    <div
-      ref={paneRootRef}
-      className={`absolute inset-0 z-20 flex flex-col bg-surface text-text transition-all duration-300 ease-out animate-in slide-in-from-bottom ${stageLockH ? "overflow-y-auto overscroll-contain" : ""}`}
-    >
+    <div className="absolute inset-0 z-20 flex flex-col bg-surface text-text transition-all duration-300 ease-out animate-in slide-in-from-bottom">
       {/* Toolbar — orca BrowserPane layout: nav · address · tools · ⋯.
           Tabs live in the terminal header strip (orca's unified tabs). */}
       <div className="shrink-0 relative z-30 flex items-center gap-1 md:gap-2 border-b border-border-subtle bg-surface/95 px-2 md:px-3 py-1.5">
@@ -1057,6 +868,7 @@ export default function BrowserPane({ busRef, connected = false, onBack, profile
         {/* Profile chip — Chrome's avatar button: the ONLY menu door now
             (tools, profiles, import, viewport all live behind it) */}
         <button
+          onPointerDown={(e) => e.preventDefault()}
           onClick={() => { setMenuSection(null); setMenuOpen(true); }}
           className="h-7 shrink-0 flex items-center gap-1.5 px-1.5 rounded-[6px] text-text-muted hover:text-text hover:bg-surface-2 transition-colors"
           title={profile}
@@ -1066,29 +878,31 @@ export default function BrowserPane({ busRef, connected = false, onBack, profile
         </button>
       </div>
 
-      {/* Stream stage — the img shrink-fits, so its rect IS the frame: every
-          input maps through that ratio and lands on the exact page pixel. */}
-      <div
-        ref={stageRef}
-        tabIndex={0}
-        onKeyDown={onKeyDown}
-        onPointerDown={onPointerDown}
-        onPointerMove={onPointerMove}
-        onPointerUp={onPointerUp}
-        onPointerCancel={onPointerUp}
-        onContextMenu={(e) => { e.preventDefault(); openContextMenu(e.clientX, e.clientY); }}
-        onPointerLeave={() => { setHoverRect(null); if (hoverTimerRef.current) { clearTimeout(hoverTimerRef.current); hoverTimerRef.current = null; } }}
-        style={{ cursor: grabIntent ? "crosshair" : cursor, ...(stageLockH ? { height: stageLockH } : {}) }}
-        className={`${stageLockH ? "shrink-0" : "flex-1 min-h-0"} bg-black relative overflow-hidden outline-none touch-none select-none flex items-start justify-center`}
-      >
-        {/* Always mounted — paint() needs the canvas BEFORE the first frame
-            state exists; hiding it via opacity breaks that chicken-and-egg. */}
-        <canvas
-          ref={imgRef}
-          width={frame?.w || 16}
-          height={frame?.h || 16}
-          className={`max-w-full max-h-full object-contain pointer-events-none ${frame ? "" : "opacity-0"}`}
-        />
+      {/* Remote Desktop's screen chrome (sidebar · canvas · keys/text · help · clipboard);
+          the browser only adds its page overlays on top of the shared canvas. */}
+      <div className="flex-1 min-h-0">
+        <RemoteShell
+          surface={surface}
+          connected={connected}
+          clipboard={clipboard}
+          hasFrame={hasFrame}
+          onRefresh={() => setRestartTick((n) => n + 1)}
+          Controls={BrowserControls}
+          bottomLayout
+          controlsProps={{
+            onNavBack: () => { refreshNav(); invoke("back", { targetId: watchedId }); },
+            onNavForward: () => { refreshNav(); invoke("forward", { targetId: watchedId }); },
+            onNavReload: () => { setLoading(true); refreshNav(); invoke("reload", { targetId: watchedId }); },
+            onFocusAddress: () => addressRef.current?.focus()
+          }}
+          canvasProps={{ cursorOverride: grabIntent ? "crosshair" : cursor === "default" ? undefined : cursor }}
+          placeholder={(
+            <div className="flex-1 flex items-center justify-center text-sm text-text-muted bg-surface">
+              {t("sites.browserPaneNotConnected")}
+            </div>
+          )}
+        >
+          <div ref={overlayRef} className="absolute inset-0 pointer-events-none">
         {hoverRect && grabIntent === "pick" && frame && imgBox && (() => {
           const meta = frame.meta || {};
           const vW = meta.deviceWidth;
@@ -1112,39 +926,16 @@ export default function BrowserPane({ busRef, connected = false, onBack, profile
             style={{ left: rubber.left, top: rubber.top, width: rubber.width, height: rubber.height }}
           />
         )}
-        {isMobile && (
-          <div
-            className="absolute bottom-[calc(var(--safe-bottom)+0.75rem)] left-3 z-10 flex items-center gap-0.5 rounded-full bg-black/70 backdrop-blur shadow-[0_2px_10px_rgba(0,0,0,0.4)] p-0.5"
-            onPointerDown={stopStagePointer}
-            onPointerMove={stopStagePointer}
-            onPointerUp={stopStagePointer}
-            onPointerCancel={stopStagePointer}
-            onContextMenu={stopStagePointer}
-          >
-            <button
-              onClick={toggleTextStrip}
-              disabled={!frame}
-              aria-label={t("mobileKeyboard.toggleTextInput")}
-              title={t("mobileKeyboard.toggleTextInput")}
-              className={`h-9 w-9 shrink-0 flex items-center justify-center rounded-full text-xs transition-colors disabled:opacity-40 disabled:pointer-events-none ${
-                textOpen ? PILL_ON : PILL_OFF
-              }`}
-            >
-              <Keyboard size={16} />
-            </button>
-            {pageTools(true)}
-          </div>
-        )}
+            {isMobile && (
+              <div className="absolute bottom-[calc(var(--safe-bottom)+0.75rem)] left-3 z-10 pointer-events-auto flex items-center gap-0.5 rounded-full bg-black/70 backdrop-blur shadow-[0_2px_10px_rgba(0,0,0,0.4)] p-0.5">
+                {pageTools(true)}
+              </div>
+            )}
 
         {/* Pick chip — bottom-right: send picks or exit pick mode */}
         {(grabIntent === "pick" || picked.length > 0) && !pickOpen && (
           <div
-            className="absolute bottom-[calc(var(--safe-bottom)+0.75rem)] right-3 z-10 flex items-center gap-1.5 rounded-full shadow-xl p-0.5"
-            onPointerDown={stopStagePointer}
-            onPointerMove={stopStagePointer}
-            onPointerUp={stopStagePointer}
-            onPointerCancel={stopStagePointer}
-            onContextMenu={stopStagePointer}
+            className="absolute bottom-[calc(var(--safe-bottom)+0.75rem)] right-3 z-10 pointer-events-auto flex items-center gap-1.5 rounded-full shadow-xl p-0.5"
           >
             {picked.length > 0 ? (
               <button
@@ -1171,13 +962,8 @@ export default function BrowserPane({ busRef, connected = false, onBack, profile
             )}
           </div>
         )}
-        {!connected && (
-          <div className="absolute inset-0 flex items-center justify-center text-sm text-text-muted bg-surface">
-            {t("sites.browserPaneNotConnected")}
-          </div>
-        )}
         {(connected && (!watchedId || blankTab)) && (
-          <div className="absolute inset-0 z-[7] overflow-y-auto bg-surface">
+          <div className="absolute inset-0 z-[7] pointer-events-auto overflow-y-auto bg-surface">
             <div className="pt-[10vh] pb-6 px-6 max-w-2xl mx-auto flex flex-col gap-6">
               <div className="flex flex-col items-center gap-2 text-center">
                 <Globe size={28} className="text-brand-500" />
@@ -1224,13 +1010,13 @@ export default function BrowserPane({ busRef, connected = false, onBack, profile
         {connected && watchedId && !frame && !loadError && (
           <button
             onClick={() => setRestartTick((n) => n + 1)}
-            className="absolute inset-0 flex items-center justify-center bg-surface text-text-muted text-sm gap-2"
+            className="absolute inset-0 pointer-events-auto flex items-center justify-center bg-surface text-text-muted text-sm gap-2"
           >
             <Loader2 size={14} className="animate-spin" /> {t("sites.browserPaneLoading")}
           </button>
         )}
         {loadError && (
-          <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 p-6 text-center bg-surface">
+          <div className="absolute inset-0 z-10 pointer-events-auto flex flex-col items-center justify-center gap-3 p-6 text-center bg-surface">
             <Globe size={28} className="text-red-500" />
             <p className="text-text text-sm font-medium">{t("sites.browserPaneLoadError")}</p>
             <p className="text-text-muted text-xs font-mono break-all max-w-md">{loadError.url}</p>
@@ -1248,41 +1034,9 @@ export default function BrowserPane({ busRef, connected = false, onBack, profile
             </div>
           </div>
         )}
+          </div>
+        </RemoteShell>
       </div>
-
-      {/* Virtual text input strip — always mounted on mobile so the keyboard
-          button can focus it synchronously inside the tap gesture (iOS). */}
-      {(isMobile || textOpen) && (
-        <div
-          className={`flex items-center gap-2 shrink-0 bg-surface ${textOpen ? "p-2 border-t border-border-subtle" : "h-0 overflow-hidden"}`}
-          style={{ paddingBottom: textOpen ? "max(0.5rem, var(--safe-bottom))" : undefined }}
-        >
-          <input
-            ref={textInputRef}
-            type="text"
-            value={textDraft}
-            onChange={(e) => setTextDraft(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && sendText()}
-            placeholder={t("sites.browserPaneSendText")}
-            enterKeyHint="send"
-            autoCapitalize="off"
-            autoCorrect="off"
-            spellCheck={false}
-            className="flex-1 min-w-0 h-11 px-4 bg-surface-2 rounded-full text-sm text-text placeholder-text-muted focus:outline-none"
-          />
-          {/* mousedown default kept off so the tap never steals focus — the keyboard stays up */}
-          <button
-            onMouseDown={(e) => e.preventDefault()}
-            onClick={sendText}
-            disabled={!textDraft}
-            aria-label={t("mobileKeyboard.send")}
-            title={t("mobileKeyboard.send")}
-            className="h-11 w-11 shrink-0 flex items-center justify-center rounded-full bg-brand-500 text-white transition-opacity disabled:opacity-40"
-          >
-            <CornerDownLeft size={18} />
-          </button>
-        </div>
-      )}
 
       {/* Element pick review (copy / send to a running session) */}
       {pickOpen && (

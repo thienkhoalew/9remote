@@ -19,6 +19,9 @@ export const useBrowserStore = create(persist((set, get) => ({
   setAgentTabs: (tabs) => set({ agentTabs: Array.isArray(tabs) ? tabs : [] }),
   workspaceProfiles: {},
   workspaceWindows: {},
+  // Device preset per workspace ({width,height,mobile} | null = follow pane) —
+  // persisted so re-entering the browser tab keeps the chosen device.
+  viewportByWorkspace: {},
   setTabs: (wsId, tabs) => set((s) => ({
     tabsByWorkspace: { ...s.tabsByWorkspace, [wsId]: Array.isArray(tabs) ? tabs : [] }
   })),
@@ -35,13 +38,17 @@ export const useBrowserStore = create(persist((set, get) => ({
   setWindowFor: (wsId, windowId) => set((s) => ({
     workspaceWindows: { ...s.workspaceWindows, [wsId || "default"]: windowId || null }
   })),
+  setViewportFor: (wsId, preset) => set((s) => ({
+    viewportByWorkspace: { ...s.viewportByWorkspace, [wsId || "default"]: preset || null }
+  })),
   profileFor: (wsId) => get().workspaceProfiles[wsId || "default"] || "default",
   windowFor: (wsId) => get().workspaceWindows[wsId || "default"] || null
 }), {
   name: "browser-ui-state",
   partialize: (state) => ({
     workspaceProfiles: state.workspaceProfiles,
-    workspaceWindows: state.workspaceWindows
+    workspaceWindows: state.workspaceWindows,
+    viewportByWorkspace: state.viewportByWorkspace
   }),
   // Same window-guarded storage pattern as terminalStore — no warnings under node/tests.
   storage: {

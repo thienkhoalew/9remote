@@ -276,6 +276,7 @@ export class ProtocolManager {
     };
     if (adapterId === "ws") {
       ctx.onRetryStatus = this._wsCallbacks.onRetryStatus;
+      ctx.onHostOffline = this._wsCallbacks.onHostOffline;
       ctx.onUrlUpdate = (upd) => {
         if (upd.tunnelUrl) this._auth.tunnelUrl = upd.tunnelUrl;
         if (upd.localIp !== undefined) this._auth.localIp = upd.localIp;

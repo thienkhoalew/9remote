@@ -107,9 +107,12 @@ export async function POST(request) {
     });
 
     if (sessionMissing) return jsonError("Session not found or expired", 404);
+    // Relay-presence verdict, computed at most once per request (a probe wakes
+    // the room's Durable Object — don't pay it twice for one login).
+    let relayVerdict = null;
+    const onRelay = async () => (relayVerdict ??= await agentOnRelay(apiKey, env));
     // Check DO relay for RTC-connected agent when tunnel is unavailable
-    const onRelay = !cached && await agentOnRelay(apiKey, env);
-    if (!cached && !onRelay) return jsonError("Server not ready. Please wait...", 503);
+    if (!cached && !(await onRelay())) return jsonError("Server not ready. Please wait...", 503);
 
     // Verify agent liveness via heartbeat timestamp and online flag
     const OFFLINE_GRACE_SEC = 300;
@@ -120,7 +123,12 @@ export async function POST(request) {
           agentSeenAt IS NOT NULL AND agentSeenAt < datetime('now', '-${OFFLINE_GRACE_SEC} seconds') AS stale
         FROM sessions WHERE apiKey = ?
       `).bind(apiKey).first());
-      if (liveness?.saidGoodbye || (liveness?.stale && !onRelay)) {
+      if (liveness?.saidGoodbye) {
+        return jsonError("agent-offline", 503);
+      }
+      // Stale D1 heartbeat may just be a hiccup — the relay room rescues a live
+      // agent. Probed only when the verdict hangs on it (cache-hit or not).
+      if (liveness?.stale && !(await onRelay())) {
         return jsonError("agent-offline", 503);
       }
     } catch (e) {

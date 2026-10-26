@@ -6,6 +6,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, utimesSync, rmSync, existsSync, realpathSync } from "fs";
+import fs from "fs";
 import { execSync } from "child_process";
 import { createRequire } from "module";
 const require = createRequire(import.meta.url);
@@ -20,6 +21,7 @@ delete process.env.CODEX_HOME;
 
 const { listAgentSessions, encodeCwdForAgent, resumeCommand, clearHistoryCache, deleteAgentSession } =
   await import("../features/terminal/agentHistory.js");
+const { HISTORY } = await import("../features/terminal/constants.js");
 
 const CWD = "/Users/Working/9remote";
 const OTHER = "/Users/Working/other";
@@ -277,6 +279,36 @@ test("limit caps the number of rows returned", async () => {
   clearHistoryCache();
   const rows = await listAgentSessions({ cwd: CWD, limit: 2 });
   assert.equal(rows.length, 2);
+});
+
+test("a capped list reads only the files it needs, not every past conversation", async () => {
+  // The list opens a file per conversation to read its title. A directory holding
+  // hundreds of past conversations is read whole on every poll, which is what
+  // made the sidebar block the host for over a second. The per-agent cap is the
+  // ceiling on how many files may be opened — never the whole pile.
+  const own = "/Users/Working/reads-only";
+  const dir = ".claude/projects/-Users-Working-reads-only";
+  const count = 200;
+  for (let i = 0; i < count; i++) {
+    write(`${dir}/many-${String(i).padStart(3, "0")}.jsonl`, jsonl(
+      { type: "user", message: { role: "user", content: `talk ${i}` } }
+    ), 1000 + i);
+  }
+  clearHistoryCache();
+  const realOpen = fs.openSync;
+  let opened = 0;
+  fs.openSync = (...args) => {
+    if (String(args[0]).includes("many-")) opened++;
+    return realOpen(...args);
+  };
+  try {
+    const rows = await listAgentSessions({ cwd: own });
+    assert.equal(rows.length, HISTORY.PER_AGENT_LIMIT);
+    assert.equal(rows[0].sessionId, "many-199");
+  } finally {
+    fs.openSync = realOpen;
+  }
+  assert.ok(opened <= HISTORY.PER_AGENT_LIMIT, `read ${opened} of ${count} files; the list should read only the newest`);
 });
 
 test("a session with no readable prompt still lists, untitled", async () => {

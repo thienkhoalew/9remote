@@ -46,7 +46,7 @@ export function startServerWithRestart(onReady, onServerCrash, onRestarted) {
       isFirstStart = false;
     }
 
-    const useDevServer = process.env.NODE_ENV === "development" && fs.existsSync(DEV_SERVER);
+    const useDevServer = process.env.NREMOTE_ENV === "development" && fs.existsSync(DEV_SERVER);
     const serverPath = useDevServer ? DEV_SERVER : STANDALONE_SERVER;
 
     if (!fs.existsSync(serverPath)) {
@@ -55,7 +55,7 @@ export function startServerWithRestart(onReady, onServerCrash, onRestarted) {
     }
 
     const spawnEnv = { ...process.env, PORT: String(SERVER_PORT) };
-    if (!useDevServer) delete spawnEnv.NODE_ENV;
+    if (!useDevServer) delete spawnEnv.NREMOTE_ENV;
 
     currentProcess = spawn(NODE_BIN, [serverPath], {
       // Neutral cwd (#42): the install dir must stay renamable — Windows pins a

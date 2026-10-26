@@ -210,6 +210,15 @@ export const parseRepoDiffPath = (p) => {
   return { status, repoPath: absPath.slice(0, i), filePath: absPath.slice(i + 1) };
 };
 
+// Absolute on-disk path behind a diff tab id. git reports repo-relative paths, so a diff
+// read from a nested repo must carry its repo along or the file is not found.
+export const resolveDiffFilePath = (diffPath, workspace) => {
+  const { repoPath, filePath } = parseRepoDiffPath(diffPath);
+  if (repoPath) return `${repoPath.replace(/\/$/, "")}/${filePath}`;
+  if (filePath.startsWith("/")) return filePath;
+  return `${workspace?.replace(/\/$/, "") || ""}/${filePath}`;
+};
+
 export const SIDEBAR_DEFAULT_WIDTH = 18;
 export const SIDEBAR_MIN_WIDTH = 12;
 export const SIDEBAR_MAX_WIDTH = 40;
@@ -228,6 +237,15 @@ export const FILE_WATCH = {
 };
 
 export const GIT_REFRESH_EVENT = "fileExplorer:gitRefresh";
+
+// Window events that mean git state may have moved — the SCM list and open diff tabs listen.
+export const GIT_AUTO_REFRESH_EVENTS = [
+  "fileExplorer:fileSaved",
+  "fileExplorer:fileCreated",
+  "fileExplorer:fileDeleted",
+  "fileExplorer:fileRenamed",
+  GIT_REFRESH_EVENT
+];
 
 export const STORAGE_KEYS = {
   sidebarWidth: "fileExplorer.sidebarWidth",

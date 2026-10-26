@@ -78,7 +78,7 @@ export const AiBashCard = memo(function AiBashCard({
             )}
           </span>
           <span className="text-text-muted select-none shrink-0 font-mono text-[11px] leading-relaxed">$</span>
-          <span className={`font-mono text-[11px] leading-relaxed text-text min-w-0 ${expanded ? "" : "line-clamp-2"}`} title={command}>
+          <span className={`font-mono text-[11px] leading-relaxed text-text min-w-0 wrap-anywhere ${expanded ? "" : "line-clamp-2"}`} title={command}>
             {command || name}
           </span>
           {isBackground && (

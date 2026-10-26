@@ -95,9 +95,10 @@ function buildShellEnv(shellPath) {
     COLORTERM: "truecolor",
     LANG: process.env.LANG || "en_US.UTF-8"
   };
-  // Don't leak agent internals (PORT, NODE_ENV) into user shells.
+  // Don't leak agent internals (PORT, NODE_ENV, NREMOTE_ENV) into user shells.
   delete env.PORT;
   delete env.NODE_ENV;
+  delete env.NREMOTE_ENV;
 
   const isZsh = shellPath.includes("zsh");
   const isBash = shellPath.includes("bash");
@@ -174,10 +175,16 @@ function createProc(procId, { bin, args = [], cwd, env, windowsVerbatimArguments
   const existing = procs.get(procId);
   if (existing && !existing.exited) return { success: false, error: "Process already running" };
 
+  // Strip host internals so agent CLIs see a clean env like a user shell.
+  const procEnv = { ...process.env, ...(env || {}) };
+  delete procEnv.PORT;
+  delete procEnv.NODE_ENV;
+  delete procEnv.NREMOTE_ENV;
+
   const child = spawn(bin, args, {
     cwd: cwd && fs.existsSync(cwd) ? cwd : getDefaultCwd(),
     stdio: ["pipe", "pipe", "pipe"],
-    env: { ...process.env, ...(env || {}) },
+    env: procEnv,
     // Own session/group: stopping a CLI can then signal the whole tree like a closed terminal.
     detached: process.platform !== "win32",
     // Windows .cmd shims arrive pre-escaped for cmd.exe (rewritten at the client

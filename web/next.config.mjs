@@ -121,7 +121,7 @@ const nextConfig = {
       ].join(" "),
       // PDFs and HTML previews render from blob: URLs; the sites host holds the
       // browsed local servers, framed by the site browser.
-      "frame-src 'self' blob: https://*.9remote.cc http://sites.localhost:3000",
+      "frame-src 'self' blob: https://*.9remote.cc http://sites.localhost:2200",
       "worker-src 'self' blob:",
       "object-src 'none'",
       "base-uri 'self'",
@@ -148,7 +148,7 @@ const nextConfig = {
       { key: "Cache-Control", value: "no-store" },
       { key: "Origin-Agent-Cluster", value: "?1" },
       { key: "Service-Worker-Allowed", value: "/" },
-      { key: "Content-Security-Policy", value: "frame-ancestors 'self' http://localhost:3000" }
+      { key: "Content-Security-Policy", value: "frame-ancestors 'self' http://localhost:2200" }
     ];
 
     return [

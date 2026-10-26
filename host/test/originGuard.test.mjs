@@ -32,7 +32,7 @@ test("the Next dev server's port is allowed too — it is another local UI", () 
   // 2208, so that origin belongs on the list. This was asserted the OTHER way until the
   // dev-server commit added the port and left the test behind — a red suite for a rule
   // that had deliberately changed.
-  assert.equal(isAllowedOrigin("http://localhost:3000"), true);
+  assert.equal(isAllowedOrigin("http://localhost:2200"), true);
   assert.equal(isAllowedOrigin("http://127.0.0.1:3000"), true);
 });
 

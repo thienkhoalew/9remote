@@ -1,17 +1,25 @@
 // 9remote browser bridge — a dumb pipe. All business logic (snapshot,
 // click gates, tab discipline, settle waits) lives in the host engine; this
 // worker drives pages with a static content-script runner + synthetic DOM
-// events, so Chrome never shows a debugging banner. It should almost never
-// change. Deliberately NOT an ES module (no import): the host bakes the relay
-// URL into this placeholder at install time, so no "type": "module" /
-// SW-cache class of bugs.
+// events (no debugging banner), or — when the user turns Debug mode on — with
+// chrome.debugger for trusted input. It should almost never change.
+// Deliberately NOT an ES module (no import): the host bakes the relay URL into
+// this placeholder at install time, so no "type": "module" / SW-cache class of bugs.
 const RELAY_URL = "__RELAY_URL__";
 
 let ws = null;
 let paused = false; // user's kill switch (popup) — survives Chrome restarts
+let debugMode = false; // popup toggle, off by default: chrome.debugger instead of the runner
+const attached = new Set(); // tab ids (strings) with a live chrome.debugger attach
 const agentTabs = new Set(); // tabs the bridge opened or drives — never "the user's focus"
 let activeTabId = null; // tab Chrome currently shows
 let prevActiveTabId = null; // tab shown before the current one — the focus restore target
+// Idle soft-detach: Chrome closes the "started debugging" banner ~5s after the
+// debugger detaches, so an idle agent gets out of the user's face. The next
+// command re-attaches transparently — the engine never notices.
+let lastCallAt = 0;
+const IDLE_DETACH_MS = 10000;
+const IDLE_SWEEP_MS = 3000;
 const GROUP_TITLE = "9remote"; // agent tabs share one named tab group
 const GROUP_COLOR = "orange"; // matches the 9remote brand
 
@@ -39,7 +47,7 @@ function normErr(tid, e) {
   const msg = e?.message || String(e);
   if (/no tab|tab not found|cannot access|chrome:\/\/|chrome web store/i.test(msg)) return `No target with given id: ${tid}`;
   if (/refused to evaluate|content security policy/i.test(msg)) {
-    return `page CSP blocks script injection — this site cannot be driven via the extension`;
+    return `page CSP blocks script injection — turn on Debug mode in the extension popup for this site`;
   }
   return msg; // anything else reads as "document navigating" to the engine
 }
@@ -114,15 +122,25 @@ const SHIM = {
     return {};
   },
   "Target.attachToTarget": async ({ targetId }) => {
-    // No debugger session exists — the session id IS the tab id.
+    // The session id IS the tab id in both modes.
     const tid = String(targetId);
+    if (debugMode && attached.has(tid)) return { sessionId: tid }; // session heal re-attaches its own target
     agentTabs.add(tid);
+    if (debugMode) {
+      // One attached page at a time — mirrors engine usage, avoids stacked infobars.
+      for (const prev of [...attached]) if (prev !== tid) detachQuiet(prev);
+      await attachDebugger(tid);
+      attached.add(tid);
+    }
     // A popup our click spawned takes the focus Chrome gives it — hand it back
     // to the tab the user was actually reading. The agent drives in background.
     snapBackFocus(tid);
     return { sessionId: tid };
   },
-  "Target.detachFromTarget": async () => ({}),
+  "Target.detachFromTarget": async ({ sessionId }) => {
+    if (debugMode) await detachQuiet(String(sessionId));
+    return {};
+  },
   "Target.getTargetInfo": async ({ targetId }) => {
     const t = await chrome.tabs.get(Number(targetId));
     return { targetInfo: { targetId: String(t.id), type: "page", title: t.title, url: t.url } };
@@ -139,7 +157,65 @@ const SHIM = {
 
 let inputAt = 0; // last Input.* dispatch — gates popup adoption below
 
+async function detachQuiet(tid) {
+  attached.delete(tid);
+  try { await chrome.debugger.detach({ tabId: Number(tid) }); } catch { /* already gone */ }
+}
+
+// The debugger target registers a beat after tabs.create — a cold attach can
+// fail with "No target with given id" even though the tab exists. Retry while
+// the tab is alive per chrome.tabs (source of truth), and surface the full
+// picture when Chrome still refuses.
+async function attachDebugger(tid) {
+  for (let i = 0; i < 10; i++) {
+    try {
+      await chrome.debugger.attach({ tabId: Number(tid) }, "1.3");
+      return;
+    } catch (e) {
+      const tabs = await chrome.tabs.query({}).catch(() => []);
+      if (!tabs.some((t) => String(t.id) === tid)) {
+        throw new Error(`attach tid=${tid}: tab not in chrome.tabs (closed?) — ${e.message}`);
+      }
+      if (i === 9) throw new Error(`attach tid=${tid}: tab alive but Chrome refuses — ${e.message}`);
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  }
+}
+
+async function dispatchDebug(method, params, targetId) {
+  if (SHIM[method]) return SHIM[method](params, targetId);
+  if (targetId == null) throw new Error(`${method} is not available via the extension`);
+  if (method.startsWith("Input.")) inputAt = Date.now();
+  const tid = String(targetId);
+  // Not attached (idle soft-detach, or this worker restarted and lost its set):
+  // try to (re)attach first. Other failures (e.g. DevTools open on the tab)
+  // must surface as themselves.
+  if (!attached.has(tid)) {
+    await attachDebugger(tid);
+    attached.add(tid);
+  }
+  try {
+    return await chrome.debugger.sendCommand({ tabId: Number(tid) }, method, params);
+  } catch (e) {
+    if (!/no target|closed|detached|not found/i.test(e?.message || "")) throw e;
+    // The idle soft-detach timer can fire between our attach check and the
+    // send — re-attach ONCE and retry before declaring the target dead.
+    try {
+      await attachDebugger(tid);
+      attached.add(tid);
+      return await chrome.debugger.sendCommand({ tabId: Number(tid) }, method, params);
+    } catch {
+      detachQuiet(tid);
+      throw new Error(`No target with given id: ${targetId}`);
+    }
+  }
+}
+
 async function dispatch(method, params, targetId) {
+  return debugMode ? dispatchDebug(method, params || {}, targetId) : dispatchRunner(method, params || {}, targetId);
+}
+
+async function dispatchRunner(method, params, targetId) {
   if (LIGHT_NOOP.has(method)) return {};
   if (method === "Runtime.evaluate") {
     if (targetId == null) throw new Error("Runtime.evaluate needs a target");
@@ -173,7 +249,7 @@ async function dispatch(method, params, targetId) {
   }
   if (SHIM[method]) return SHIM[method](params, targetId);
   if (LIGHT_UNSUPPORTED.has(method)) {
-    throw new Error(`${method} is not available via the extension`);
+    throw new Error(`${method} is not available — turn on Debug mode in the extension popup`);
   }
   throw new Error(`${method} is not available via the extension`);
 }
@@ -182,6 +258,21 @@ function send(frame) {
   try { ws?.send(JSON.stringify(frame)); } catch { /* relay down — close handler reconnects */ }
 }
 
+chrome.debugger.onEvent.addListener((source, method, params) => {
+  send({ t: "event", method, params, sessionId: String(source.tabId ?? source.targetId) });
+});
+// "Cancel" on the debug infobar, DevTools open, or tab close — surface it the
+// way CDP would so the engine drops and rebuilds the session instead of wedging.
+chrome.debugger.onDetach.addListener((source) => {
+  const tid = String(source.tabId ?? source.targetId);
+  attached.delete(tid);
+  send({ t: "event", method: "Target.detachedFromTarget", params: { sessionId: tid, targetId: tid } });
+});
+// The idle sweep behind the soft-detach (see lastCallAt above).
+setInterval(() => {
+  if (!attached.size || Date.now() - lastCallAt < IDLE_DETACH_MS) return;
+  for (const tid of [...attached]) detachQuiet(tid);
+}, IDLE_SWEEP_MS);
 // Synthesize Target.targetCreated the engine's popup adoption listens for —
 // chrome.tabs never surfaces browser-level target events.
 const POPUP_WINDOW_MS = 1500; // born within this after our Input dispatch = the agent's click
@@ -198,15 +289,15 @@ chrome.tabs.onCreated.addListener((tab) => {
     ...((tab.openerTabId != null && agentPopup) ? { openerId: String(tab.openerTabId) } : {})
   } } });
 });
-// Synthesize the main-frame navigation events settle() keys its nav tail on
-// (a debugger session would get them from CDP for free).
+// Runner mode: synthesize the main-frame navigation events settle() keys its
+// nav tail on (a debugger session gets them from CDP for free).
 chrome.webNavigation.onBeforeNavigate.addListener((d) => {
-  if (d.frameId !== 0) return;
+  if (debugMode || d.frameId !== 0) return;
   send({ t: "event", method: "Page.frameRequestedNavigation",
     params: { frame: {}, disposition: "currentTab" }, sessionId: String(d.tabId) });
 });
 chrome.webNavigation.onCommitted.addListener((d) => {
-  if (d.frameId !== 0) return;
+  if (debugMode || d.frameId !== 0) return;
   send({ t: "event", method: "Page.frameNavigated",
     params: { frame: { id: "0", url: d.url } }, sessionId: String(d.tabId) });
 });
@@ -216,17 +307,19 @@ chrome.webNavigation.onCommitted.addListener((d) => {
 chrome.tabs.onActivated.addListener(({ tabId }) => {
   if (activeTabId !== tabId) { prevActiveTabId = activeTabId; activeTabId = tabId; }
 });
-// A closed tab is gone for good — never adopt onto its id again.
+// A closed tab is gone for good — never re-attach or adopt onto its id.
 chrome.tabs.onRemoved.addListener((tabId) => {
+  attached.delete(String(tabId));
   runnerTabs.delete(tabId);
 });
 
-// The user's kill switch: pause = drop the relay, hard. Nothing rides
+// The user's kill switch: pause = drop debugger + relay, hard. Nothing rides
 // through; the host simply sees the extension go offline.
 async function setPaused(next) {
   paused = next;
   try { await chrome.storage.local.set({ paused: next }); } catch { /* non-fatal */ }
   if (next) {
+    for (const tid of [...attached]) detachQuiet(tid);
     try { ws?.close(); } catch { /* already closed */ }
     ws = null;
   } else if (!ws) {
@@ -234,20 +327,28 @@ async function setPaused(next) {
   }
 }
 
-// Popup surface — status + the pause toggle.
+// Popup surface — status + the pause and Debug mode toggles.
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.t === "status") {
     let host = "";
     try { host = new URL(RELAY_URL).host; } catch { /* keep empty */ }
     sendResponse({
       connected: ws?.readyState === WebSocket.OPEN, host,
-      version: chrome.runtime.getManifest().version, paused
+      version: chrome.runtime.getManifest().version, paused, debug: debugMode
     });
     return false;
   }
   if (msg?.t === "setPaused") {
     setPaused(Boolean(msg.paused)).then(() => sendResponse({ ok: true }));
     return true;
+  }
+  if (msg?.t === "setDebug") {
+    debugMode = Boolean(msg.debug);
+    try { chrome.storage.local.set({ debug: debugMode }); } catch { /* non-fatal */ }
+    // Leaving Debug mode: drop every attach so the banner clears in seconds.
+    if (!debugMode) for (const tid of [...attached]) detachQuiet(tid);
+    sendResponse({ ok: true, debug: debugMode });
+    return false;
   }
 });
 
@@ -260,6 +361,7 @@ function connect() {
     try { m = JSON.parse(ev.data); } catch { return; }
     if (m.t === "ping") return send({ t: "pong" });
     if (m.t !== "call") return;
+    lastCallAt = Date.now();
     try { send({ t: "result", id: m.id, result: await dispatch(m.method, m.params, m.targetId) }); }
     catch (e) { send({ t: "result", id: m.id, error: e?.message || String(e) }); }
   };
@@ -268,7 +370,8 @@ function connect() {
   ws.onerror = () => { try { ws?.close(); } catch { /* retry via onclose */ } };
 }
 // Boot: honor a persisted pause before the first connection attempt.
-chrome.storage.local.get(["paused"]).then((saved) => {
+chrome.storage.local.get(["paused", "debug"]).then((saved) => {
   paused = Boolean(saved?.paused);
+  debugMode = Boolean(saved?.debug); // off unless the user turned it on
   if (!paused) connect();
 }).catch(() => connect());

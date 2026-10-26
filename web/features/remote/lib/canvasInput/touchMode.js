@@ -161,17 +161,19 @@ export function handleTouchEvent(ctx, event, type, options) {
             ctx.emitScrollFromDelta(overflowY);
           };
 
-          // zoom = 1: direct vertical scroll (like 2-finger on a macbook)
-          if (ctx.canvasZoom === 1) {
+          const size = ctx.containerSize() || { width: 0, height: 0 };
+          const displaySize = ctx.displaySizeAt(ctx.canvasZoom);
+          const canPan = displaySize.width > size.width || displaySize.height > size.height;
+
+          // zoom = 1 and fits in container: direct vertical scroll (like 2-finger on a macbook)
+          if (!canPan && ctx.canvasZoom === 1) {
             if (isVerticalSwipe) processScroll(deltaY);
             ctx.lastTouchCenterRef.current = { x: touch.clientX, y: touch.clientY };
             return;
           }
 
-          // zoom > 1: pan first, edge scroll only when fully at the edge
+          // can pan (zoom > 1 or canvas taller/wider than container): pan first, edge scroll only when fully at the edge
           ctx.setIsPanning(true);
-          const size = ctx.containerSize() || { width: 0, height: 0 };
-          const displaySize = ctx.displaySizeAt(ctx.canvasZoom);
           ctx.setCanvasPan(prev => {
             const r = panWithEdgeOverflow({ prevPan: prev, deltaX, deltaY, containerSize: size, displaySize });
             if (Math.abs(r.overflowY) > 0) {

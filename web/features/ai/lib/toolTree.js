@@ -28,18 +28,23 @@ const shellLabel = (t) => t?.input?.description || t?.input?.command || "shell";
  * stops guessing. The tool-row scan below is the FALLBACK for engines that keep no task
  * model of their own — codex and antigravity hand work off without ever saying its name
  * again, and for those the row is all there is.
+ *
+ * A row reaches the strip only with a card behind it: a task whose tool call this pane's
+ * log does not hold has nothing to show, so it is dropped rather than pinned as a chip
+ * that opens an empty modal.
  */
 export function runningAsync(messages = [], harnessTasks = []) {
   if (harnessTasks.length > 0) {
     return harnessTasks
       .filter((t) => t?.status === "running")
+      .filter((t) => t.toolUseId && findTaskTool(messages, t.toolUseId))
       .map((t) => ({
         kind: t.background ? "shell" : "agent",
         // Two ids, deliberately: `id` is what the pane's own rows are keyed by (the tool
         // call), while `taskId` is the name the CLI minted and the only one a stop can
         // address. They coincide on a row the scan produced, and only there is a stop
         // meaningless anyway — nothing on the other side answers to a tool call id.
-        id: t.toolUseId || t.taskId,
+        id: t.toolUseId,
         taskId: t.taskId,
         label: t.description || t.subagentType || "task",
         // The rest of the harness's own record, passed through for the reader that draws
@@ -65,8 +70,10 @@ function scanRunningRows(messages = []) {
       if (t?.status === "running") {
         const startedAt = t.startedAt || t.timestamp;
         const extra = startedAt ? { startedAt } : null;
-        if (LAUNCH_TOOLS.has(t?.name)) out.push({ kind: "agent", id: t.id, label: agentLabel(t), ...extra });
-        else if (t?.async) out.push({ kind: "shell", id: t.id, label: shellLabel(t), ...extra });
+        // `toolUseId` mirrors `id`: the scan found the card, so the modal and the activity
+        // line can find it again by the same key the harness path uses.
+        if (LAUNCH_TOOLS.has(t?.name)) out.push({ kind: "agent", id: t.id, toolUseId: t.id, label: agentLabel(t), ...extra });
+        else if (t?.async) out.push({ kind: "shell", id: t.id, toolUseId: t.id, label: shellLabel(t), ...extra });
       }
       if (t?.children?.length) walk(t.children);
     }

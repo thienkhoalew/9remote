@@ -3,18 +3,28 @@
 import { useEffect, useState } from "react";
 import { WORKSPACE_GIT_POLL_MS } from "../constants/terminalConfig";
 import { pollWhileVisible } from "@/shared/utils/visibilityPoll";
+import { GIT_AUTO_REFRESH_EVENTS } from "@/features/fileExplorer/constants/fileExplorer.js";
 
 // One changed-file count per workspace root, covering the root repo and every repo under
 // it. Ref-counted and shared, so the terminal badge and the git panel read the same
 // number from a single poll instead of counting separately and disagreeing.
-const entries = new Map(); // rootPath → { state, stop, refs, subs, fileBus }
+const entries = new Map(); // rootPath → { state, stop, refs, subs, fileBus, refreshNow }
 
 const EMPTY = { count: 0, perRepo: {} };
+
+const samePerRepo = (a, b) => {
+  const keys = Object.keys(a);
+  return keys.length === Object.keys(b).length && keys.every((k) => a[k] === b[k]);
+};
 
 function fetchOnce(entry, rootPath, force) {
   entry.fileBus?.gitWorkspaceChangedCount?.(rootPath, undefined, force).then((res) => {
     if (!res?.success) return;
-    entry.state = { count: res.count || 0, perRepo: res.perRepo || {} };
+    const count = res.count || 0;
+    const perRepo = res.perRepo || {};
+    // Unchanged numbers must not re-render every subscribed pane.
+    if (entry.state.count === count && samePerRepo(entry.state.perRepo, perRepo)) return;
+    entry.state = { count, perRepo };
     entry.subs.forEach((fn) => fn(entry.state));
   });
 }
@@ -22,8 +32,12 @@ function fetchOnce(entry, rootPath, force) {
 function acquire(rootPath, fileBus) {
   let entry = entries.get(rootPath);
   if (!entry) {
-    entry = { state: EMPTY, stop: null, refs: 0, subs: new Set(), fileBus };
+    entry = { state: EMPTY, stop: null, refs: 0, subs: new Set(), fileBus, refreshNow: null };
     entries.set(rootPath, entry);
+    // Save/commit/refresh events mean the count may have moved — refetch now instead of
+    // waiting for the poll tick. One listener per root, not per subscriber.
+    entry.refreshNow = () => fetchOnce(entry, rootPath);
+    GIT_AUTO_REFRESH_EVENTS.forEach((ev) => window.addEventListener(ev, entry.refreshNow));
     fetchOnce(entry, rootPath);
     entry.stop = pollWhileVisible(() => fetchOnce(entry, rootPath), WORKSPACE_GIT_POLL_MS);
   }
@@ -37,6 +51,7 @@ function release(rootPath) {
   entry.refs--;
   if (entry.refs > 0) return;
   entry.stop?.();
+  GIT_AUTO_REFRESH_EVENTS.forEach((ev) => window.removeEventListener(ev, entry.refreshNow));
   entries.delete(rootPath);
 }
 

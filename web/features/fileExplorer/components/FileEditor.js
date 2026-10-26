@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ChevronLeft, Copy, GitBranch, Loader2, Save, X, Eye, FileCode } from "@/shared/components/ui/Icon";
+import { ChevronLeft, Copy, GitBranch, Loader2, Save, X, Eye, FileCode, Globe } from "@/shared/components/ui/Icon";
 import { vibrate } from "@/shared/utils/vibration";
 import { useI18n } from "@/shared/i18n";
 import CodeEditor from "./CodeEditor.js";
@@ -11,6 +11,7 @@ import ImageDiffView from "./ImageDiffView.js";
 import TextPreview from "./TextPreview.js";
 import UnsavedDialog from "./UnsavedDialog.js";
 import { getTextPreviewKind, isImageFile } from "../constants/fileExplorer.js";
+import { openHtmlPreviewInBrowser } from "../lib/previewInBrowser.js";
 import { useFileDocument } from "../hooks/useFileDocument.js";
 import { useUnsavedGuard } from "../hooks/useUnsavedGuard.js";
 import EditorKeyBar from "./EditorKeyBar.js";
@@ -36,8 +37,12 @@ export default function FileEditor({ filePath, fileBus, onBack, line, column, wo
 
   // Text files with rendered forms (html, markdown, mermaid) can flip between source and preview.
   const previewKind = !diffOnly && !previewOnly ? getTextPreviewKind(filePath) : null;
+  // HTML renders in the remote browser pane, not in-place: its "preview" hands a
+  // loopback preview URL to the browser view instead of swapping this editor.
+  const isHtmlPreview = previewKind === "html";
   // Opened by a Preview click, this starts rendered; every other open starts as source.
   const [showRendered, setShowRendered] = useState(preview && !!previewKind);
+  const [previewError, setPreviewError] = useState("");
   const [saveSeq, setSaveSeq] = useState(0);
   const [lastPath, setLastPath] = useState(filePath);
   const [prevSaved, setPrevSaved] = useState(false);
@@ -45,12 +50,32 @@ export default function FileEditor({ filePath, fileBus, onBack, line, column, wo
   if (lastPath !== filePath) {
     setLastPath(filePath);
     setShowRendered(preview && !!previewKind);
+    setPreviewError("");
   }
   // Edge-trigger justSaved into a counter the preview can reload on.
   if (doc.justSaved !== prevSaved) {
     setPrevSaved(doc.justSaved);
     if (doc.justSaved) setSaveSeq((s) => s + 1);
   }
+
+  // HTML preview opens in the remote browser pane; this editor stays on source.
+  const openBrowserPreview = useCallback(() => {
+    openHtmlPreviewInBrowser(fileBus, filePath).then((r) => {
+      if (!r.ok) setPreviewError(r.error || t("editor.previewFailed"));
+    });
+  }, [fileBus, filePath, t]);
+  // A Preview open takes HTML straight to the browser pane.
+  useEffect(() => {
+    if (!isHtmlPreview || !preview) return;
+    let cancelled = false;
+    openHtmlPreviewInBrowser(fileBus, filePath).then((r) => {
+      if (!cancelled && !r.ok) setPreviewError(r.error || t("editor.previewFailed"));
+    });
+    return () => { cancelled = true; };
+  // t is stable enough for an error string: a locale dict landing late must not
+  // re-run the open (it would spawn a duplicate tab).
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isHtmlPreview, preview, fileBus, filePath]);
 
   const registerView = useCallback((readText, view) => { viewRef.current = view; }, []);
 
@@ -137,13 +162,23 @@ export default function FileEditor({ filePath, fileBus, onBack, line, column, wo
         )}
 
         {previewKind && (
-          <button
-            onClick={() => { vibrate(); setShowRendered((v) => !v); }}
-            title={showRendered ? t("editor.editCode") : t("editor.preview")}
-            className="p-2 bg-surface-2 hover:bg-surface-3 text-text rounded-brand transition-all duration-150 ease-out active:scale-[0.96]"
-          >
-            {showRendered ? <FileCode size={16} /> : <Eye size={16} />}
-          </button>
+          isHtmlPreview ? (
+            <button
+              onClick={() => { vibrate(); openBrowserPreview(); }}
+              title={t("editor.previewInBrowser")}
+              className="p-2 bg-surface-2 hover:bg-surface-3 text-text rounded-brand transition-all duration-150 ease-out active:scale-[0.96]"
+            >
+              <Globe size={16} />
+            </button>
+          ) : (
+            <button
+              onClick={() => { vibrate(); setShowRendered((v) => !v); }}
+              title={showRendered ? t("editor.editCode") : t("editor.preview")}
+              className="p-2 bg-surface-2 hover:bg-surface-3 text-text rounded-brand transition-all duration-150 ease-out active:scale-[0.96]"
+            >
+              {showRendered ? <FileCode size={16} /> : <Eye size={16} />}
+            </button>
+          )
         )}
 
         {!previewOnly && !diffOnly && (
@@ -177,6 +212,11 @@ export default function FileEditor({ filePath, fileBus, onBack, line, column, wo
           {doc.error}
         </div>
       )}
+      {previewError && (
+        <div className="bg-red-500/20 border-b border-red-500/50 px-4 py-2 text-red-400 text-sm break-words">
+          {previewError}
+        </div>
+      )}
 
       <div className="flex-1 min-h-0 overflow-hidden">
         {diffOnly ? (
@@ -193,7 +233,7 @@ export default function FileEditor({ filePath, fileBus, onBack, line, column, wo
           )
         ) : previewOnly ? (
           <FilePreview filePath={filePath} fileBus={fileBus} />
-        ) : showRendered && previewKind ? (
+        ) : showRendered && previewKind && !isHtmlPreview ? (
           <TextPreview kind={previewKind} filePath={filePath} fileBus={fileBus} content={doc.content} reloadKey={saveSeq} />
         ) : doc.loading ? (
           <div className="h-full flex items-center justify-center text-text-muted">{t("common.loading")}</div>

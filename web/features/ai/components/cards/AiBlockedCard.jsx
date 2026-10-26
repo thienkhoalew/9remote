@@ -33,7 +33,7 @@ export const AiBlockedCard = memo(function AiBlockedCard({
         )}
       </div>
 
-      <div className="p-2.5 rounded bg-bg text-[11px] text-text border border-border-subtle mb-3 whitespace-pre-wrap break-words max-h-[160px] overflow-y-auto">
+      <div className="p-2.5 rounded bg-bg text-[11px] text-text border border-border-subtle mb-3 whitespace-pre-wrap wrap-anywhere max-h-[160px] overflow-y-auto">
         {message || reason || "The CLI refused this action under the current permission mode."}
       </div>
 

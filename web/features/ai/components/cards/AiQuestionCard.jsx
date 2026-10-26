@@ -142,11 +142,11 @@ export const AiQuestionCard = memo(function AiQuestionCard({
           return (
             <div key={idx} className="flex flex-col gap-0.5">
               <span className="text-[12px] font-normal text-text-muted leading-snug">{q.question}</span>
-              <span className="font-mono text-text pl-2 border-l-2 border-success/40">{a}</span>
+              <span className="font-mono text-text pl-2 border-l-2 border-success/40 wrap-anywhere">{a}</span>
             </div>
           );
         })}
-        {!past && <span className="font-mono text-text">{String(answers)}</span>}
+        {!past && <span className="font-mono text-text wrap-anywhere">{String(answers)}</span>}
       </div>
     );
   }

@@ -8,7 +8,8 @@ import {
 
 // Canvas viewport: server dimensions, fit scale, zoom/pan state and their clamping.
 // Owns the resize/orientation pipeline; input gestures live in useCanvas.
-export function useCanvasViewport() {
+export function useCanvasViewport(options = {}) {
+  const { stageLockRef } = options;
   const canvasRef = useRef(null);
   const canvasContainerRef = useRef(null);
 
@@ -82,7 +83,7 @@ export function useCanvasViewport() {
     const maxPan = maxPanFor(size, displaySizeAt(canvasZoom));
 
     setCanvasPan(prev => {
-      if (!active || canvasZoom <= 1) return clampPan(prev, maxPan);
+      if (!active || (canvasZoom <= 1 && maxPan.y >= 0)) return clampPan(prev, maxPan);
       const { y } = keyboardPanTarget({ focus, containerHeight: size.height, totalScale: scale });
       return clampPan({ x: prev.x, y }, maxPan);
     });
@@ -95,12 +96,16 @@ export function useCanvasViewport() {
     const server = serverDimensionsRef.current;
     if (!container || !canvas || server.width === 0 || server.height === 0) return;
 
-    const size = { width: container.clientWidth, height: container.clientHeight };
+    const lock = stageLockRef?.current;
+    const effectiveHeight = lock?.kbShrunk && lock.height ? lock.height : container.clientHeight;
+    const size = { width: container.clientWidth, height: effectiveHeight };
+    // display:none (keep-mounted pane hidden) reports 0x0 — keep the last good fit.
+    if (size.width === 0 || size.height === 0) return;
     const scale = fitScaleFor(size, server);
     setFitScale(scale);
     // baseCanvasSize is the scaled size at zoom=1 — used for pan boundary math
     setBaseCanvasSize({ width: server.width * scale, height: server.height * scale });
-  }, []);
+  }, [stageLockRef]);
 
   // Handle resize/rotate. Debounce collapses the burst (resize + orientationchange +
   // visualViewport.resize fire in one turn), then an rAF poll waits for the container to
@@ -222,6 +227,7 @@ export function useCanvasViewport() {
     resetZoom,
     resetPan,
     panForKeyboard,
-    handleCanvasDimensions
+    handleCanvasDimensions,
+    recalculateDisplaySize
   };
 }

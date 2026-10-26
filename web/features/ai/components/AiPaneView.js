@@ -34,7 +34,7 @@ import { makePanePointerHandlers } from "@/shared/utils/paneActivation";
 import PaneStripButtons from "@/features/terminal/components/PaneStripButtons";
 import NotePanel from "@/features/terminal/components/NotePanel";
 import { OVERLAY_BTN_CLS, OVERLAY_ICON_SM } from "@/features/terminal/components/TerminalPane";
-import { useGitChangedCount } from "@/features/terminal/hooks/useGitChangedCount";
+import { useWorkspaceChangedCount } from "@/features/terminal/hooks/useWorkspaceChangedCount";
 import { vibrate } from "@/shared/utils/vibration";
 import {
   backgroundSrc,
@@ -116,8 +116,8 @@ export const AiPaneView = memo(function AiPaneView({
   const openRightPanel = useTerminalStore((s) => s.openRightPanel);
   // What the AI showed from this chat, newest first — same stack the terminal pane reads.
   const artifacts = useTerminalStore((s) => s.artifactsBySession[sessionId]);
-  // One poll per workspace path, shared with any terminal standing in the same one.
-  const changedCount = useGitChangedCount(workspacePath, fileBus, { enabled: isFocused && showFolderButton });
+  // One poll per workspace path, shared with the terminal panes and the git panel.
+  const { count: changedCount } = useWorkspaceChangedCount(workspacePath, fileBus, { enabled: isFocused && showFolderButton });
   const { theme } = useTheme();
 
   // Chat text is plain prose, not terminal output — take only fg/bg from the

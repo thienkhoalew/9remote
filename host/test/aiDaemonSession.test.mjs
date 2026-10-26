@@ -114,7 +114,7 @@ test("a hydrate ack ships a tail and says there is more — that is what arms sc
 test("one door reads the CLI's store, and nothing asks whether the log looks thin", () => {
   const SESSION = fs.readFileSync(path.join(root, "host/features/ai/aiSession.js"), "utf8");
   assert.match(SESSION, /_rebuildFromStore\(sessionId, leafOverride = null\) \{/);
-  assert.match(SESSION, /return recovered\?\.length \? renumber\(capLog\(recovered\)\) : null;/);
+  assert.match(SESSION, /events: bundle\.events\?\.length \? renumber\(capLog\(bundle\.events\)\) : null,/);
   assert.ok(!SESSION.includes("isFullerLog"), "the thin-log rule must be gone, not renamed");
   assert.doesNotMatch(SESSION, /recoveredTurns > snapTurns/);
   assert.doesNotMatch(SESSION, /turns > known/);
@@ -213,7 +213,9 @@ test("every payload-bearing event is capped before it enters the re-serialized l
   const SESSION = fs.readFileSync(path.join(root, "host/features/ai/aiSession.js"), "utf8");
   assert.match(SESSION, /data = capEvent\(event, data\);/);
   assert.match(SESSION, /function capEvent\(event, data\)/);
-  assert.match(SESSION, /capLog\(recovered\)/);
+  // The rebuild caps what it adopts — one read of the store serves both readers, so the
+  // events arrive under the bundle rather than a bare `recovered` array.
+  assert.match(SESSION, /capLog\(bundle\.events\)/);
   assert.match(SESSION, /renumber\(capLog\(merged\)\)/);
 });
 

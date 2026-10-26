@@ -114,6 +114,12 @@ export async function refreshTunnelUrl(pm) {
     });
     if (!res.ok) {
       debugLog("transport", `[pm] refreshTunnelUrl: HTTP ${res.status}`);
+      // The Worker vouched the host process is down — surface as offline UI
+      // instead of riding the retry ladder against a dead machine.
+      const body = await res.json().catch(() => ({}));
+      if (res.status === 503 && body?.error === "agent-offline") {
+        pm._wsCallbacks.onHostOffline?.();
+      }
       return;
     }
     const data = await res.json();

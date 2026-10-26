@@ -21,6 +21,7 @@ import TerminalSidebar from "@/features/terminal/components/TerminalSidebar";
 import TerminalStatusBar, { MobileStatusStrip } from "@/features/terminal/components/TerminalStatusBar";
 import MobileDock from "@/features/mobile/components/MobileDock";
 import TerminalRightPanel from "@/features/terminal/components/TerminalRightPanel";
+import { useWorkspaceChangedCount } from "@/features/terminal/hooks/useWorkspaceChangedCount";
 import TerminalEditorPanel from "@/features/terminal/components/TerminalEditorPanel";
 import OverflowTip from "@/shared/components/ui/OverflowTip";
 import TerminalBeam from "@/shared/components/ui/TerminalBeam";
@@ -93,6 +94,7 @@ function TerminalWorkspace({
   onAddWorkspace, onOpenSettings, homeDir, recentWorkspaces,
   rightPanel, editorPanel, mobilePanel, onOpenArtifact, fileBus,
   browserPanel = null,
+  browserVisible = true,
   onCreateAnyHost, onQuickCreateHostAware,
   tunnelUrl, apiKey, connectionMode,
   onResumeAgentSessionForeign = null,
@@ -160,6 +162,9 @@ function TerminalWorkspace({
   // workspacePath of the focused terminal (a workspace migrated from a group has no path).
   const activeWorkspace = workspaces.find((w) => w.id === activeWorkspaceId);
   const baseRoot = activeWorkspace?.path || activeSession?.workspacePath || null;
+  // One shared poll for the workspace's changed counts — the git tab badge reads perRepo
+  // and every pane badge reads count, so the two can never disagree.
+  const changedCounts = useWorkspaceChangedCount(baseRoot, panelsFileBus);
   // A pane's folder button reveals its live cwd into the files tab only — git/worktrees
   // tabs keep the workspace root, so a deep cwd must not blank their repo scan.
   const rightPanelRoots = useTerminalStore((s) => s.rightPanelRoots);
@@ -238,7 +243,8 @@ function TerminalWorkspace({
   // Exactly one host and no workspace: show the two-half poster stage (workspace/remote).
   // Multi-host skips this stage so the user sees the fleet instead.
   const fleetHostCount = useFleetStore((s) => Object.keys(s.hosts).length);
-  const showWelcomeStage = showEmptyState && !workspaces.length && fleetHostCount <= 1;
+  // A browser on top wins: its pane lives in the panes container this stage replaces.
+  const showWelcomeStage = showEmptyState && !workspaces.length && fleetHostCount <= 1 && !(browserPanel && browserVisible);
 
   // The collapsed panel stays mounted so its width can animate, but only after a first
   // open — otherwise a user who never opens it still pays for the tree and git scan.
@@ -529,11 +535,14 @@ function TerminalWorkspace({
   // Browser pane rides inside the panes container (not a full-view overlay), so the
   // shell keeps its header/sidebar while it is up.
   const browserActive = !!browserPanel;
+  // Mounted ≠ on top: the pane outlives its view (keep-mounted), so parking and
+  // pane-hiding must follow the VIEW state, not the mount state.
+  const browserOnTop = browserActive && browserVisible;
 
   return (
     // Park LEFT when hidden: translate-x-full made the overflow:hidden container horizontally pannable on iOS, leaving the session list stuck shifted left; the negative side creates no scrollable extent.
     <div
-      className={`absolute inset-0 flex flex-col ${isTerminalView || browserActive || pairDashboard || welcomeActive ? "translate-x-0 opacity-100 z-10" : "-translate-x-full opacity-0 z-0 pointer-events-none"}`}
+      className={`absolute inset-0 flex flex-col ${isTerminalView || browserOnTop || pairDashboard || welcomeActive ? "translate-x-0 opacity-100 z-10" : "-translate-x-full opacity-0 z-0 pointer-events-none"}`}
     >
       <div ref={rowRef} className={`flex-1 min-h-0 relative ${isDesktop ? "flex flex-row" : "flex flex-col"}`}>
         {isDesktop && (
@@ -686,8 +695,10 @@ function TerminalWorkspace({
               onSwitch: nav.handleSelectSession
             })}
           >
+            {/* display:none keeps the pane (and its canvas) alive while another
+                tab is focused — the pane pauses its stream when not visible. */}
             {browserActive && (
-              <div className="absolute inset-0 z-10">{browserPanel}</div>
+              <div className={`absolute inset-0 z-10 ${browserVisible ? "" : "hidden"}`}>{browserPanel}</div>
             )}
             {renderedSessions.map((sessionId) => {
               const inActiveWorkspace = workspaceSessionIds.has(sessionId);
@@ -705,7 +716,7 @@ function TerminalWorkspace({
                   key={sessionId}
                   ref={(el) => registerPaneElement(sessionId, el)}
                   className={
-                    browserActive || !inActiveWorkspace || (isDesktop && fullMode && !isFocused) || (isDesktop && isHidden)
+                    browserOnTop || !inActiveWorkspace || (isDesktop && fullMode && !isFocused) || (isDesktop && isHidden)
                       ? "hidden"
                       : isDesktop
                       ? `h-full relative bg-bg ${hostUpdating ? "opacity-50 pointer-events-none" : ""} ${fullMode ? "w-full flex-1" : `border-r-2 border-border-subtle last:border-r-0 ${isPaneResizing ? "" : "transition-[width] duration-200 ease-out"}`}`
@@ -871,6 +882,7 @@ function TerminalWorkspace({
               onAddWorkspace={onAddWorkspace}
               homeDir={homeDir}
               hiddenRepos={workspaceHiddenRepos}
+              changedPerRepo={changedCounts.perRepo}
               onHiddenReposChange={activeWorkspace && onSetHiddenRepos ? handleHiddenReposChange : null}
               isDesktop={isDesktop}
             />

@@ -7,7 +7,7 @@ import ConfirmDialog from "@/shared/components/ui/ConfirmDialog";
 import FileContextMenu from "@/shared/components/ui/FileContextMenu";
 import { useI18n } from "@/shared/i18n";
 import useIsTouch from "@/shared/hooks/useIsTouch.js";
-import { GIT_STATUS_COLORS, GIT_REFRESH_EVENT, makeDiffPath, makeRepoDiffPath } from "../constants/fileExplorer.js";
+import { GIT_STATUS_COLORS, GIT_REFRESH_EVENT, GIT_AUTO_REFRESH_EVENTS, makeDiffPath, makeRepoDiffPath } from "../constants/fileExplorer.js";
 import { resolveFileIcon } from "../constants/fileIcons.js";
 import { commitSummary, pushSummary, pullSummary } from "../lib/gitOutput.js";
 import { addToGitignore } from "../lib/gitignore.js";
@@ -123,9 +123,8 @@ export default function ScmPanel({ workspace, fileBus, onOpenFile, tagDiffWithRe
   useEffect(() => {
     if (typeof window === "undefined") return;
     const handler = () => reload();
-    const events = ["fileExplorer:fileSaved", "fileExplorer:fileCreated", "fileExplorer:fileDeleted", "fileExplorer:fileRenamed", GIT_REFRESH_EVENT];
-    events.forEach(ev => window.addEventListener(ev, handler));
-    return () => events.forEach(ev => window.removeEventListener(ev, handler));
+    GIT_AUTO_REFRESH_EVENTS.forEach(ev => window.addEventListener(ev, handler));
+    return () => GIT_AUTO_REFRESH_EVENTS.forEach(ev => window.removeEventListener(ev, handler));
   }, [reload]);
 
   const { changes, untracked } = useMemo(() => {
@@ -316,7 +315,9 @@ export default function ScmPanel({ workspace, fileBus, onOpenFile, tagDiffWithRe
           <button
             type="button"
             title={t("common.refresh")}
-            onClick={() => { vibrate(); reload(); }}
+            // Broadcast instead of calling reload() directly: the listener above reloads
+            // this list and every open diff tab refetches too.
+            onClick={() => { vibrate(); window.dispatchEvent(new Event(GIT_REFRESH_EVENT)); }}
             className="p-1 text-text-muted hover:text-text"
           >
             <RefreshCw size={12} className={loading ? "animate-spin" : ""} />

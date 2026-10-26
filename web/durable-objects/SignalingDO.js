@@ -115,6 +115,18 @@ export async function handleSignaling(request, env) {
 
 // An agent that last spoke longer ago than this is a sleep/crash corpse — presence must not vouch for it.
 const AGENT_FRESH_MS = 180000;
+// D1 heartbeat freshness (/api/session/heartbeat beats every 120s) — mirrors
+// /api/connect's OFFLINE_GRACE_SEC.
+const AGENT_SEEN_FRESH_MS = 300000;
+// Reconnect-storm breaker. A broken peer can loop join→die ~2×/s (measured Oct
+// 2026: 177k joins/day on one room, each wake billing ~10s of DO duration —
+// the room's $12.50/mo). A legit host restart joins once; even an update cycle
+// stays in single digits per window. Past this rate the upgrade is refused and
+// the client's own pre-open cap (5 failures) ends the loop. Per-isolate state:
+// hibernation resets it, which is fine — a storm keeps the DO awake, so the
+// counter survives exactly when it matters.
+const STORM_MAX_JOINS = 10;
+const STORM_WINDOW_MS = 30000;
 
 // Forward-only relay. DO stays dumb about SDP/ICE semantics. One room = one deviceId,
 // two roles (agent + client). WebSocket Hibernation: ping/pong auto-replied by runtime,
@@ -123,19 +135,41 @@ export class SignalingDO extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
+    // Reconnect-storm counters, per role — see STORM_MAX_JOINS. Role keys, so a
+    // looping client can never 429 the room's agent, and a looping agent only
+    // locks itself out until it slows to a legit cadence.
+    this._joins = {};
   }
 
   async fetch(request) {
     const url = new URL(request.url);
     if (url.pathname === "/presence") {
       const now = Date.now();
-      const live = this.ctx.getWebSockets().some((p) => {
-        const att = p.deserializeAttachment();
-        return att?.role === "agent" && now - (att.aliveAt || 0) < AGENT_FRESH_MS;
-      });
-      return Response.json({ agentPresent: live });
+      const agent = this.ctx.getWebSockets().find((p) => p.deserializeAttachment()?.role === "agent");
+      const att = agent?.deserializeAttachment();
+      if (!att) return Response.json({ agentPresent: false });
+      // Free liveness first: the runtime auto-answers "ping" without waking this
+      // DO and stamps the reply time. A live host pings every 10s, so a stamp
+      // older than AGENT_FRESH_MS means the process is dead even if its socket
+      // lingers half-open. Covers post-hb hosts without a D1 read.
+      const lastPong = this.ctx.getWebSocketAutoResponseTimestamp?.(agent);
+      if (lastPong && now - lastPong.getTime() < AGENT_FRESH_MS) return Response.json({ agentPresent: true });
+      // WS hb (old hosts) is the next fast path; the D1 HTTP heartbeat is the durable one.
+      if (att.aliveAt && now - att.aliveAt < AGENT_FRESH_MS) return Response.json({ agentPresent: true });
+      const apiKey = this.ctx.id?.name;
+      if (!apiKey || !this.env?.DB) return Response.json({ agentPresent: false });
+      const row = await this.env.DB.prepare("SELECT agentSeenAt FROM sessions WHERE apiKey = ?").bind(apiKey).first();
+      const seen = row?.agentSeenAt ? new Date(`${String(row.agentSeenAt).replace(" ", "T")}Z`).getTime() : NaN;
+      return Response.json({ agentPresent: !Number.isNaN(seen) && now - seen < AGENT_SEEN_FRESH_MS });
     }
     const role = url.searchParams.get("role");
+    // Storm breaker — see STORM_MAX_JOINS. Refused attempts are not counted, so
+    // the window rolls even while a storm keeps knocking.
+    const now = Date.now();
+    const joins = (this._joins[role] ||= []);
+    while (joins.length && now - joins[0] >= STORM_WINDOW_MS) joins.shift();
+    if (joins.length >= STORM_MAX_JOINS) return new Response("Reconnect storm — retry later", { status: 429 });
+    joins.push(now);
     // peerId identifies a specific client (deviceId:tab). Multiple clients share
     // a room (room = apiKey), so role alone can't address them.
     const peerId = url.searchParams.get("from") || null;

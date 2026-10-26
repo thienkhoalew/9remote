@@ -34,11 +34,12 @@ assert.equal(settled[1].status, "done", "everything else is still settled at the
 assert.deepEqual(runningAgents([{ tools: [agentRow] }]), [{ id: "call_k0w30z5a", label: "agent" }]);
 
 // A background shell is the same shape one kind over: the CLI returned at once, the
-// command did not. Its label is the command, not the word "Bash".
+// command did not. Its label is the command, not the word "Bash". Scan rows carry
+// `toolUseId` so the modal can find the card they were scanned from.
 const shellRow = { id: "call_tk1xn81v", name: "Bash", status: "running", async: true, handle: "b6bdgo9ez", input: { description: "Background shell probe 90s" } };
 assert.deepEqual(runningAsync([{ tools: [agentRow, shellRow] }]), [
-  { kind: "agent", id: "call_k0w30z5a", label: "agent" },
-  { kind: "shell", id: "call_tk1xn81v", label: "Background shell probe 90s" },
+  { kind: "agent", id: "call_k0w30z5a", toolUseId: "call_k0w30z5a", label: "agent" },
+  { kind: "shell", id: "call_tk1xn81v", toolUseId: "call_tk1xn81v", label: "Background shell probe 90s" },
 ]);
 // An ordinary Bash row is not work in flight, however it ended up marked.
 assert.deepEqual(runningAsync([{ tools: [{ id: "b", name: "Bash", status: "running" }] }]), []);

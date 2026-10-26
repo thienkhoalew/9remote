@@ -54,6 +54,9 @@ export function buildWebStatic() {
   fs.writeFileSync(path.join(MIRROR_DIR, ".gitignore"), ".next/\nout/\n");
   if (!fs.existsSync(path.join(MIRROR_DIR, ".git"))) execSync("git init -q", { cwd: MIRROR_DIR });
 
+  // Static path skips web's prebuild hook, keep node_modules iOS 15-safe before the mirror build
+  execSync("node scripts/patchIos15Regex.mjs", { cwd: WEB_DIR, stdio: "inherit" });
+
   execSync("npx next build --webpack", {
     cwd: MIRROR_DIR,
     stdio: "inherit",

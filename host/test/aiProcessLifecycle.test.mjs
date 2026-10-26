@@ -234,7 +234,7 @@ await test("a failed codex respawn holds prompts without spinning a loop", async
   assert.equal(errors.length, 1, "the pane hears why it went quiet");
 });
 
-// ── queued-prompt injection ──────────────────────────────────────────────────
+// ── queued-prompt lifecycle ──────────────────────────────────────────────────
 
 const runningSession = (id, adapter) => {
   const events = [];
@@ -244,57 +244,34 @@ const runningSession = (id, adapter) => {
   return { s, events };
 };
 
-await test("a queued prompt injects into the running turn instead of stopping it", async () => {
-  const injected = [];
-  let stopped = 0;
-  const { s, events } = runningSession("queue-inject", {
+await test("a queued prompt stays in queue during tool results instead of injecting mid-turn", async () => {
+  const { s, events } = runningSession("queue-stays-during-tools", {
     pendingRequests: new Map(),
-    stop: async () => {},
-    injectPrompt: (text) => injected.push(text)
+    stop: async () => {}
   });
-  s.stop = () => { stopped++; };
   try {
     s.promptQueue.push({ id: "q1", text: "dung pytest di", attachments: null });
     s.emitNormalized("tool_result", { id: "t1", status: "done" });
-    assert.deepEqual(injected, ["dung pytest di"], "the prompt rides the CLI's internal queue");
-    assert.equal(stopped, 0, "the turn is not interrupted");
     assert.equal(s.isTurnRunning, true, "the turn keeps running");
-    assert.deepEqual(s.getQueue(), [], "the item left the host queue");
-    assert.ok(events.includes("user_message"), "the pane still renders the injected message");
+    assert.deepEqual(s.getQueue().map((i) => i.text), ["dung pytest di"], "prompt remains in queue");
+    assert.ok(!events.includes("user_message"), "user_message is not emitted mid-turn");
   } finally {
     s.destroy();
   }
 });
 
-await test("engines without injection still stop at the tool boundary", async () => {
-  let stopped = 0;
-  const { s } = runningSession("queue-stop-fallback", {
-    pendingRequests: new Map(),
-    toolCalls: new Map(),
-    interrupt: () => true
+await test("a queued prompt drains and starts a new turn when the running turn completes", async () => {
+  const sent = [];
+  const { s } = runningSession("queue-drains-on-turn-end", {
+    pendingRequests: new Map()
   });
-  s.stop = () => { stopped++; };
+  s.sendPrompt = (text) => sent.push(text);
   try {
-    s.promptQueue.push({ id: "q1", text: "p", attachments: null });
-    s.emitNormalized("tool_result", { id: "t1", status: "done" });
-    await soon(20);
-    assert.equal(stopped, 1, "the loop is interrupted so the prompt starts a new turn");
-  } finally {
-    s.destroy();
-  }
-});
-
-await test("a refused injection requeues the prompt at the head", async () => {
-  const { s, events } = runningSession("queue-inject-refused", {
-    pendingRequests: new Map(),
-    injectPrompt: () => { throw new Error("pipe closed"); }
-  });
-  try {
-    s.promptQueue.push({ id: "q1", text: "p1", attachments: null });
-    s.promptQueue.push({ id: "q2", text: "p2", attachments: null });
-    s.emitNormalized("tool_result", { id: "t1", status: "done" });
-    assert.deepEqual(s.getQueue().map((i) => i.text), ["p1", "p2"], "order preserved, nothing dropped");
-    assert.ok(events.includes("error"), "the pane hears why the message did not land");
+    s.promptQueue.push({ id: "q1", text: "cau tiep theo", attachments: null });
+    s.emitNormalized("turn_complete", { stats: {} });
+    await soon(70);
+    assert.deepEqual(sent, ["cau tiep theo"], "queued prompt is sent as a new turn");
+    assert.deepEqual(s.getQueue(), [], "queue is drained");
   } finally {
     s.destroy();
   }

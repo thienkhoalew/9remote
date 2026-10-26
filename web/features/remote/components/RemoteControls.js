@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import Button from "@/shared/components/ui/Button";
+import Btn from "@/shared/components/ui/KeyButton";
 import {
   ChevronLeft, ChevronRight, RefreshCw, Keyboard, HelpCircle, Hand, Settings, MoreHorizontal, X, Bug, Monitor, Plus, CornerDownLeft, Mic, MicOff, History, Bell, Eye, EyeOff
 } from "@/shared/components/ui/Icon";
@@ -23,28 +24,6 @@ import KeyCustomizeModal from "@/shared/components/ui/KeyCustomizeModal";
 import { useI18n } from "@/shared/i18n";
 
 const v = (fn, ...args) => { vibrate(); fn?.(...args); };
-
-// onMouseDown.preventDefault() — prevents focus-steal so native keyboard stays on.
-function Btn({ active, primary, pinned, children, className = "", onClick, ...rest }) {
-  const base = "shrink-0 px-1 h-8 rounded-brand text-xs font-semibold shadow-sm disabled:opacity-50 disabled:cursor-not-allowed min-w-[34px] flex items-center justify-center";
-  const normal = "bg-surface-2 hover:bg-surface-3 text-text transition-all duration-150 ease-out active:scale-[0.94]";
-  const activeCls = "bg-brand-500 text-white shadow-sm transition-all duration-150 ease-out active:scale-[0.94]";
-  const primaryCls = "bg-green-600 hover:bg-green-700 text-white shadow-sm transition-all duration-150 ease-out active:scale-[0.94]";
-  const pinnedCls = "bg-brand-500/15 hover:bg-brand-500/25 text-brand-400 transition-all duration-150 ease-out active:scale-[0.94]";
-  const variant = active ? activeCls : pinned ? pinnedCls : primary ? primaryCls : normal;
-  return (
-    <button
-      type="button"
-      onMouseDown={(e) => e.preventDefault()}
-      onClick={onClick}
-      className={`${base} ${variant} ${className}`}
-      style={{ touchAction: "manipulation", WebkitTapHighlightColor: "transparent" }}
-      {...rest}
-    >
-      {children}
-    </button>
-  );
-}
 
 export default function RemoteControls({
   streaming,
@@ -171,6 +150,7 @@ export default function RemoteControls({
       );
     }
     if (kc.type === "desktop") {
+      if (!onDesktopSwitch) return null;
       const SideIcon = kc.direction === "prev" ? ChevronLeft : kc.direction === "next" ? ChevronRight : Plus;
       return (
         <Btn
@@ -367,9 +347,11 @@ export default function RemoteControls({
       {/* Top toolbar — portrait only (landscape buttons moved to left toolbar / bottom) */}
       <div className="flex items-center gap-1.5 px-2 py-1 landscape:hidden">
         <div className={`${rowClass} flex-1 min-w-0 px-0 py-0 landscape:py-0`}>
-          <Btn onClick={() => v(onClose)} title={t("remote.back")} pinned className="landscape:hidden">
-            <ChevronLeft size={16} />
-          </Btn>
+          {onClose && (
+            <Btn onClick={() => v(onClose)} title={t("remote.back")} pinned className="landscape:hidden">
+              <ChevronLeft size={16} />
+            </Btn>
+          )}
           {clipboardNew && clipboardText ? (
             <Btn
               onClick={() => v(onOpenClipboard)}
@@ -447,7 +429,7 @@ export default function RemoteControls({
         );
         const enterBtn = pinned ? renderPoolKey(pinned, "pinned", true) : null;
         return (
-          <div className={`px-2 py-1 safe-area-bottom ${tallLandscape ? "landscape:px-0" : "landscape:py-2"}`}>
+          <div className={`px-2 py-1 ${inputMode === "mouse" ? "" : "safe-area-bottom"} ${tallLandscape ? "landscape:px-0" : "landscape:py-2"}`}>
             {/* Portrait: modifier scroll + pinned Enter */}
             <div className="flex items-center gap-1.5 landscape:hidden">
               <div className={`${rowClass} flex-1 min-w-0`}>

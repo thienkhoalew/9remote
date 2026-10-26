@@ -2,6 +2,10 @@
 
 import { useState, useEffect, useCallback, useRef } from "react";
 
+// Same-tab instances of one key: localStorage only syncs across tabs, so peers
+// registered here relay writes to each other.
+const peersByKey = new Map();
+
 // Generic useState wrapper that persists value to localStorage under `key`.
 // Safely handles SSR (no window) and JSON parse errors.
 export function usePersistedState(key, initialValue) {
@@ -27,6 +31,18 @@ export function usePersistedState(key, initialValue) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [key]);
 
+  // Register this instance's setter so same-key peers can relay writes to it
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    let peers = peersByKey.get(key);
+    if (!peers) peersByKey.set(key, (peers = new Set()));
+    peers.add(setValue);
+    return () => {
+      peers.delete(setValue);
+      if (!peers.size) peersByKey.delete(key);
+    };
+  }, [key]);
+
   // Persist on change
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -35,6 +51,10 @@ export function usePersistedState(key, initialValue) {
       window.localStorage.setItem(key, JSON.stringify(value));
     } catch (err) {
       console.warn(`usePersistedState: failed to write "${key}"`, err);
+    }
+    // Relay to same-key instances in this tab — localStorage alone is cross-tab only
+    for (const peer of peersByKey.get(key) || []) {
+      if (peer !== setValue) peer(value);
     }
   }, [key, value]);
 

@@ -31,12 +31,17 @@ export const useConnectionStore = create((set) => ({
   // status bar shows it so "local vs tunnel" is verifiable, not guessed.
   endpoint: null,
   retryStatus: { isRetrying: false, attempt: 0, maxAttempts: 10, failed: false },
+  // The Worker vouched the host process is down (/api/connect 503
+  // agent-offline) — a standing verdict like approvalStatus, cleared on
+  // connect or manual retry (both re-ask the Worker).
+  hostOffline: false,
 
   setConnection: (patch) => set((prev) => ({ ...prev, ...patch })),
   setConnected: (connected) => set({ connected }),
   setCarrier: (carrier) => set({ carrier }),
   setConnectionMode: (connectionMode) => set({ connectionMode }),
   setRetryStatus: (retryStatus) => set({ retryStatus }),
+  setHostOffline: (hostOffline) => set({ hostOffline }),
   setAuthKey: (authKey) => set({ authKey }),
   setAdmitted: (admitted) => set({ admitted }),
   // Unified device-approval verdict, arriving from socket.io OR the DO
@@ -61,6 +66,7 @@ export const useConnectionStore = create((set) => ({
     endpoint: null,
     approvalStatus: null,
     admitted: false,
+    hostOffline: false,
     retryStatus: { isRetrying: false, attempt: 0, maxAttempts: 10, failed: false }
   })
 }));

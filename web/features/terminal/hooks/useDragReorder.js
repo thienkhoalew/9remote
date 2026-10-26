@@ -113,10 +113,15 @@ export function useDragReorder({ axis = "y", threshold = 12, onCommit, onTap }) 
 
     // Tears the drag down. `commit` is false when the release was never seen (a newer
     // drag superseding this one), so a half-finished drag never reorders the list.
-    // `released` is true only for a real pointerup (not blur/cancel/lost release).
+    // `released` is true only for a real release — pointerup, or its compat mouseup when
+    // WebKit drops the pointer event — not blur/cancel/lost release.
     const finish = (commit, released = false) => {
+      // The same release can arrive twice (pointerup then mouseup): the first run already
+      // tore everything down, so a second run must not re-select or re-commit.
+      if (finishRef.current !== finish) return;
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("mouseup", onUp);
       window.removeEventListener("pointercancel", onUp);
       window.removeEventListener("blur", onUp);
       finishRef.current = null;
@@ -141,11 +146,14 @@ export function useDragReorder({ axis = "y", threshold = 12, onCommit, onTap }) 
       onCommit?.(next);
     };
 
-    const onUp = (ev) => finish(true, ev?.type === "pointerup");
+    const onUp = (ev) => finish(true, ev?.type === "pointerup" || ev?.type === "mouseup");
     finishRef.current = finish;
 
     window.addEventListener("pointermove", onMove, { passive: false });
     window.addEventListener("pointerup", onUp);
+    // WebKit can drop the pointerup outright (tap-to-click): the compat mouseup under it
+    // still arrives, and without it a tab tap only selects once the mouse moves again.
+    window.addEventListener("mouseup", onUp);
     window.addEventListener("pointercancel", onUp);
     window.addEventListener("blur", onUp);
   }, [axis, threshold, onCommit, onTap]);

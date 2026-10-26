@@ -12,8 +12,8 @@ import { handleMouseEvent } from "@/features/remote/lib/canvasInput/mouseMode";
 import { handleTrackpadEvent } from "@/features/remote/lib/canvasInput/trackpadMode";
 import { handleTouchEvent } from "@/features/remote/lib/canvasInput/touchMode";
 
-export function useCanvas(socketEmitFunctions) {
-  const viewport = useCanvasViewport();
+export function useCanvas(socketEmitFunctions, options = {}) {
+  const viewport = useCanvasViewport(options);
   const {
     canvasRef, canvasContainerRef, canvasZoom, setCanvasZoom, canvasPan, setCanvasPan,
     fitScale, baseCanvasSize, containerSize, displaySizeAt, getCanvasCoordinates, recordInteractPx
@@ -353,6 +353,7 @@ export function useCanvas(socketEmitFunctions) {
     releaseHandHold,
     handleCanvasInteraction,
     handleCanvasDimensions: viewport.handleCanvasDimensions,
-    serverDimensionsRef: viewport.serverDimensionsRef
+    serverDimensionsRef: viewport.serverDimensionsRef,
+    recalculateDisplaySize: viewport.recalculateDisplaySize
   };
 }

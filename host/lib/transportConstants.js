@@ -21,6 +21,12 @@ export const CONTROL_RTC_MAX_BYTES = 65536;
 export const RTC_HEARTBEAT_INTERVAL_MS = 3_000;
 export const RTC_HEARTBEAT_TIMEOUT_MS = 9_000;
 
+// Route control away from an RTC peer whose inbound (pongs/events) has been
+// silent this long — a zombie DC stays "open" until the heartbeat closes it,
+// silently blackholing broadcasts meanwhile. 2× interval = no false positive
+// on a live link, and it fires before RTC_HEARTBEAT_TIMEOUT_MS closes the peer.
+export const RTC_LIVENESS_GATE_MS = 6_000;
+
 // Device-approval answers sent over signaling. Mirrored in
 // web/shared/constants/transport.js — the client maps these to its approval UI
 // instead of treating them as a transport failure.

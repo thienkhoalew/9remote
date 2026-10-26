@@ -4,7 +4,7 @@ import { broadcast } from "../../transport/broadcast.js";
 import { CHANNELS } from "../../lib/transportConstants.js";
 import { STREAM_RESYNC_MIN_MS, TABS_POLL_MS } from "./constants.js";
 import { encodeTilesBatch } from "../remote/handlers/ScreenHandler.js";
-import { closeTab, createProfile, enrichHistory, evalJs, focusTab, getOrLaunchBrowser, goBack, goForward, inspectElementAt, listProfiles, listTabs, markPicked, navState, navigateTab, noteBrowserActivity, noteWatchedWindow, openTab, peekBrowser, peekTabs, pickElementsInRect, reloadTab, removeProfile, safeProfileName, searchHistory, setViewport, syncActiveTab } from "./browserEngine.js";
+import { adoptLiveBrowsers, closeTab, createProfile, enrichHistory, evalJs, focusTab, forgetWorkspaceWindow, getOrLaunchBrowser, goBack, goForward, inspectElementAt, liveWindowId, listProfiles, listTabs, lookupWorkspaceWindow, markPicked, navState, navigateTab, noteBrowserActivity, noteWatchedWindow, openTab, peekBrowser, peekTabs, pickElementsInRect, recordWorkspaceWindow, reloadTab, removeProfile, safeProfileName, searchHistory, setViewport, syncActiveTab } from "./browserEngine.js";
 import { ackFrame, compareClientTileHashes, dispatchInput, startStream, stopStream } from "./stream.js";
 import { importCookiesToSession, parseCookiesContent } from "./cookieImport.js";
 import { detectInstalledBrowsers, extractBrowserCookies } from "./browserDetect.js";
@@ -17,6 +17,9 @@ let tabsPollTimer = null;
 // first push for THAT profile even when its tabs did not change.
 const lastTabsJsonByProfile = new Map();
 const watchingProfiles = new Map(); // `${profile}|${windowId}` -> watcher count
+// Workspace → window ownership lives in the engine (persisted to disk): it
+// survives host restarts, so a browser session recovers on its own as long
+// as its Chrome is still alive.
 
 async function pushTabs(profile, windowId = null) {
   try {
@@ -37,10 +40,11 @@ async function pushTabs(profile, windowId = null) {
     enrichHistory(tabs);
     const json = JSON.stringify(tabs);
     const dedupeKey = `${profile}|${windowId == null ? "" : windowId}`;
-    if (json === lastTabsJsonByProfile.get(dedupeKey)) return;
+    if (json === lastTabsJsonByProfile.get(dedupeKey)) return tabs;
     lastTabsJsonByProfile.set(dedupeKey, json);
     const io = getIO();
     if (io) broadcast(io, "browser:tabs", { profile, windowId, tabs });
+    return tabs;
   } catch { /* wait next poll */ }
 }
 
@@ -124,6 +128,7 @@ const lastCursorValue = new Map(); // targetId -> cursor
 // Resync throttle (per target): each resync mints a full frame — a spamming
 // or looping client must not turn that into a bandwidth firehose.
 const lastResyncAt = new Map();
+let adoptedLive = false;
 
 async function probeCursor(profile, targetId, x, y) {
   const id = String(targetId || "");
@@ -190,6 +195,14 @@ function emitTiles(frame, frameTs = Date.now()) {
 
 export function setupBrowserHandlers(socket) {
   ensureAgentPoll();
+  // Once per host process: re-adopt every Chrome that survived a previous
+  // host (crash or hand-off) — recovery + orphan RAM reclaim in one sweep.
+  if (!adoptedLive) {
+    adoptedLive = true;
+    void adoptLiveBrowsers().then((names) => {
+      if (names.length) logger.info(`Adopted live browser profile(s): ${names.join(", ")}`);
+    });
+  }
   // One watched (profile, window) per socket — the workspace the client is
   // looking at: its profile AND its own Chrome window of that profile.
   let watchingProfile = null;
@@ -205,25 +218,41 @@ export function setupBrowserHandlers(socket) {
     eventPushTimer = setTimeout(pushAllTabs, 120);
   });
 
-  socket.on("browser:tabs.watch", ({ on, profile, windowId } = {}) => {
+  // Serialized per socket: two watches in flight (a rapid window switch) must
+  // not interleave their async validation and double-count the refcount.
+  let watchChain = Promise.resolve();
+  const handleTabsWatch = async ({ on, profile, windowId, workspaceId } = {}, cb) => {
     const name = safeProfileName(profile) ? profile : "default";
-    const win = Number.isFinite(Number(windowId)) && Number(windowId) > 0 ? Number(windowId) : null;
-    const next = on !== false;
-    if (next && (watchingProfile !== name || watchingWindowId !== win)) {
-      if (watchingProfile) setTabsWatching(-1, watchingProfile, watchingWindowId);
-      watchingProfile = name;
-      watchingWindowId = win;
-      noteWatchedWindow(name, win);
-      // Fresh watcher on this key gets a first push even when its tabs are
-      // unchanged — the dedupe would otherwise leave the strip empty.
-      lastTabsJsonByProfile.delete(`${name}|${win == null ? "" : win}`);
-      setTabsWatching(1, name, win);
-    } else if (!next && watchingProfile) {
+    // The client's windowId is a localStorage hint — the host is the source of
+    // truth. A dead hint falls back to the window this workspace owns.
+    let win = on !== false && Number.isFinite(Number(windowId)) && Number(windowId) > 0 ? Number(windowId) : null;
+    if (win != null) win = await liveWindowId(name, win);
+    if (win == null && on !== false && workspaceId) {
+      const recorded = lookupWorkspaceWindow(name, workspaceId);
+      if (recorded != null) win = await liveWindowId(name, recorded);
+    }
+    if (win != null && workspaceId) recordWorkspaceWindow(name, workspaceId, win);
+    // A null win registers nothing: a null-window push is unfiltered and would
+    // leak every window of the profile into this workspace's strip.
+    if (watchingProfile && (on === false || watchingProfile !== name || watchingWindowId !== win)) {
       setTabsWatching(-1, watchingProfile, watchingWindowId);
       noteWatchedWindow(watchingProfile, null);
       watchingProfile = null;
       watchingWindowId = null;
     }
+    if (on !== false && win != null && watchingProfile == null) {
+      watchingProfile = name;
+      watchingWindowId = win;
+      noteWatchedWindow(name, win);
+      // Fresh watcher on this key gets a first push even when its tabs are
+      // unchanged — the dedupe would otherwise leave the strip empty.
+      lastTabsJsonByProfile.delete(`${name}|${win}`);
+      setTabsWatching(1, name, win);
+    }
+    cb?.({ ok: true, windowId: win, tabs: win == null ? [] : await pushTabs(name, win) });
+  };
+  socket.on("browser:tabs.watch", (payload = {}, cb) => {
+    watchChain = watchChain.then(() => handleTabsWatch(payload, cb)).catch(() => {});
   });
 
   socket.on("browser:invoke", async ({ action, payload = {} } = {}, cb) => {
@@ -241,8 +270,21 @@ export function setupBrowserHandlers(socket) {
           return cb?.({ ok: true, ...(await getOrLaunchBrowser(profile).then(() => ({}), (e) => ({ error: e.message }))) });
         case "viewport":
           return cb?.({ ok: true, ...(await setViewport(profile, payload.targetId, payload.width, payload.height, { mobile: !!payload.mobile, reset: !!payload.reset })) });
-        case "open":
-          return cb?.({ ok: true, ...(await openTab(profile, payload.url, { newWindow: !!payload.newWindow, windowId: payload.windowId || null })) });
+        case "open": {
+          const res = await openTab(profile, payload.url, { newWindow: !!payload.newWindow, windowId: payload.windowId || null });
+          // The opened tab names the workspace's window — host-side ownership,
+          // so any other client can adopt the session later.
+          if (res?.windowId != null && payload.workspaceId) recordWorkspaceWindow(profile, payload.workspaceId, res.windowId);
+          return cb?.({ ok: true, ...res });
+        }
+        case "window.forWorkspace": {
+          // Session adoption: a fresh client asks which Chrome window this
+          // workspace owns; validation kills ids from a Chrome restart.
+          let win = lookupWorkspaceWindow(profile, payload.workspaceId);
+          win = await liveWindowId(profile, win);
+          if (win == null && payload.workspaceId) forgetWorkspaceWindow(profile, payload.workspaceId);
+          return cb?.({ ok: true, windowId: win });
+        }
         case "close":
           return cb?.({ ok: true, ...(await closeTab(profile, payload.targetId)) });
         case "focus":

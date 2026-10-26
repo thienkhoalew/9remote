@@ -3,7 +3,7 @@
 import { useEffect, useRef, memo, useState, useCallback } from "react";
 import "@xterm/xterm/css/xterm.css";
 import SelectionActionButton from "@/features/terminal/components/SelectionActionButton";
-import { useGitChangedCount } from "@/features/terminal/hooks/useGitChangedCount";
+import { useWorkspaceChangedCount } from "@/features/terminal/hooks/useWorkspaceChangedCount";
 import { useXTerm } from "@/features/terminal/hooks/useXTerm";
 import { THEMES, resolveTerminalTheme } from "@/features/terminal/constants/themes";
 import { ChevronDown, Folder, Loader2, RefreshCw, ListChecks, Sparkles } from "@/shared/components/ui/Icon";
@@ -242,8 +242,10 @@ function TerminalPane({
     };
   }, [termRef, termReady, isVisible]);
 
-  // Each pane counts its own cwd; the hook shares one poll per unique cwd across panes.
-  const shownCount = useGitChangedCount(cwd, fileBus, { enabled: isVisible });
+  // Workspace-wide count (root repo + nested ones), shared with the git panel so the
+  // two badges read one number from one poll. Sessions without a workspace fall back
+  // to the live cwd, which is where that pane actually stands.
+  const { count: shownCount } = useWorkspaceChangedCount(workspacePath || cwd, fileBus, { enabled: isVisible });
 
   const badgeLabel = shownCount > MAX_CHANGED_BADGE ? `${MAX_CHANGED_BADGE}+` : shownCount;
 

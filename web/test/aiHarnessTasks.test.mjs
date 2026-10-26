@@ -182,13 +182,24 @@ test("a record the reader does not model is still carried through the replay", (
 
 
 test("a task the CLI says is running is what the strip shows", () => {
-  const rows = runningAsync([], [
+  const messages = [{ tools: [{ id: "c1", name: "Bash", status: "running", async: true, input: { description: "build" } }] }];
+  const rows = runningAsync(messages, [
     { taskId: "shell-1", toolUseId: "c1", status: "running", background: true, description: "build" },
     { taskId: "agent-1", toolUseId: "c2", status: "completed", background: false, description: "look" }
   ]);
   const shape = ({ kind, id, taskId, label }) => ({ kind, id, taskId, label });
   assert.deepEqual(rows.map(shape), [{ kind: "shell", id: "c1", taskId: "shell-1", label: "build" }],
     "the CLI's status decides, not a row that was handed off");
+});
+
+test("a running task with no card in this pane is dropped, not pinned empty", () => {
+  const messages = [{ tools: [{ id: "c1", name: "Bash", status: "running", async: true, input: { description: "build" } }] }];
+  const rows = runningAsync(messages, [
+    { taskId: "t-9", toolUseId: "", status: "running", background: true, description: "probe" },
+    { taskId: "t-8", status: "running", background: true, description: "live-set only" },
+    { taskId: "t-7", toolUseId: "c_missing", status: "running", background: false, description: "before the window" }
+  ]);
+  assert.deepEqual(rows, [], "a chip that would open an empty modal is not information");
 });
 
 test("with no task set the row scan still answers, for engines that keep no model", () => {

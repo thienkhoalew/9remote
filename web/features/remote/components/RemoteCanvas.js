@@ -42,7 +42,9 @@ export default function RemoteCanvas({
   screenLocked,
   unlockReady,
   unlockResult,
-  onUnlockSubmit
+  onUnlockSubmit,
+  cursorOverride,
+  children
 }) {
   // Canvas physical size = server resolution (set via canvas.width/height in handleCanvasDimensions).
   // CSS transform: scale(fitScale * canvasZoom) to fit into container then apply user zoom.
@@ -114,6 +116,9 @@ export default function RemoteCanvas({
 
   // Re-focus canvas on every pointerdown so clicks never "steal" focus away.
   const handlePointerDown = (e) => {
+    // Soft keyboard on: a touch tap must not move focus off the sink textarea
+    // (the blur would close the keyboard) — cancel the native focus default.
+    if (keyboardOn && e.pointerType !== "mouse") e.preventDefault();
     const ae = document.activeElement;
     if (ae?.name === "remote-batch-input") {
       if (keyboardOn) {
@@ -165,6 +170,7 @@ export default function RemoteCanvas({
         className={`block ${cursorClass} bg-black outline-none`}
         style={{
           touchAction: "none",
+          cursor: cursorOverride,
           transformOrigin: "top left",
           userSelect: "none",
           WebkitUserSelect: "none",
@@ -295,6 +301,10 @@ export default function RemoteCanvas({
       )}
 
       </div>
+      {/* View-specific overlays (browser pick rings, load states...) sit over the stage but
+          OUTSIDE the touch container, so taps on them never reach the canvas handlers. */}
+      {children}
+
       {/* Monitor selector — sibling of the touch container so taps never bubble
           into the canvas pointer/touch handlers. Independent overlay. */}
       <MonitorSwitcher

@@ -32,25 +32,14 @@ export function useFileDocument({ filePath, fileBus }) {
   // The editor calls this once it can read its own document.
   const register = useCallback((readText) => { readTextRef.current = readText; }, []);
 
-  // Read the file into the document. `isCancelled` lets the mount effect abandon a read
-  // whose file has already been switched away from; reload() passes nothing.
-  const load = useCallback(async (isCancelled = () => false) => {
-    setLoading(true);
-    setError("");
-    setDirty(false);
-    setStaleOnDisk(false);
-
+  // Read the file's text. Over ~64KB the host cannot answer inline (SCTP message
+  // limit) and asks us to stream the file instead.
+  const readText = useCallback(async (isCancelled = () => false) => {
     const result = await fileBus.readFile(filePath);
-    if (isCancelled()) return;
-    if (!result?.success) {
-      setError(result?.error || "");
-      setLoading(false);
-      return;
-    }
+    if (isCancelled()) return { cancelled: true };
+    if (!result?.success) return { error: result?.error || "" };
 
     let text = result.content;
-    // Over ~64KB the host cannot answer inline (SCTP message limit) and asks us to
-    // stream the file instead.
     if (result.streamInstead) {
       try {
         const chunks = [];
@@ -62,20 +51,37 @@ export function useFileDocument({ filePath, fileBus }) {
             onError: reject
           });
         });
-        if (isCancelled()) return;
+        if (isCancelled()) return { cancelled: true };
         text = await new Blob(chunks).text();
       } catch (e) {
-        if (isCancelled()) return;
-        setError(e?.message || "");
-        setLoading(false);
-        return;
+        if (isCancelled()) return { cancelled: true };
+        return { error: e?.message || "" };
       }
+    }
+    return { text };
+  }, [filePath, fileBus]);
+
+  // Read the file into the document. `isCancelled` lets the mount effect abandon a read
+  // whose file has already been switched away from; reload() passes nothing.
+  const load = useCallback(async (isCancelled = () => false) => {
+    setLoading(true);
+    setError("");
+    setDirty(false);
+    setStaleOnDisk(false);
+
+    const { text, error } = await readText(isCancelled);
+    if (text === undefined) {
+      if (error !== undefined) {
+        setError(error);
+        setLoading(false);
+      }
+      return;
     }
 
     originalRef.current = text;
     setContent(text);
     setLoading(false);
-  }, [filePath, fileBus]);
+  }, [readText]);
 
   useEffect(() => {
     let cancelled = false;
@@ -93,13 +99,26 @@ export function useFileDocument({ filePath, fileBus }) {
     return () => { cancelled = true; };
   }, [filePath, load]);
 
-  // Someone else wrote the file. Clean documents take the new text straight away;
-  // a dirty one only raises the flag, because replacing text the user is halfway
-  // through typing loses work no undo can reach.
+  // External change on a clean document: read without the loading state and swap
+  // only when the disk really differs — the echo of our own save lands as a no-op
+  // instead of a flash that rebuilds the editor and drops the cursor.
+  const silentReload = useCallback(async () => {
+    const { text } = await readText();
+    if (text === undefined || text === originalRef.current) return;
+    // The user typed while the read was in flight — offer the reload, never clobber.
+    const live = readTextRef.current?.();
+    if (live != null && live !== originalRef.current) { setStaleOnDisk(true); return; }
+    originalRef.current = text;
+    setContent(text);
+  }, [readText]);
+
+  // Someone else wrote the file. Clean documents take the new text quietly; a dirty
+  // one only raises the flag, because replacing text the user is halfway through
+  // typing loses work no undo can reach.
   const onChangedOnDisk = useCallback(() => {
     if (dirty) { setStaleOnDisk(true); return; }
-    load();
-  }, [dirty, load]);
+    silentReload();
+  }, [dirty, silentReload]);
 
   useEffect(() => () => clearTimeout(savedTimerRef.current), []);
 

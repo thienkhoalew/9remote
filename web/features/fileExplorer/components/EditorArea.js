@@ -129,6 +129,7 @@ export default function EditorArea({
               onCursorChange={onEditorStateChange}
               onDirtyChange={handleDirtyChange}
               onRegisterSaver={registerSaver}
+              onOpenFile={onOpenFile}
               previewSeq={previewRequest?.path === path ? previewRequest.seq : 0}
             />
           </div>

@@ -128,11 +128,11 @@ export function handleTrackpadEvent(ctx, event, type, options) {
         ctx.socketEmitFunctions.emitMouseMove?.(percentX, percentY);
       }
 
-      // Auto-follow pan: keep the cursor inside the viewport margin (zoomed only,
+      // Auto-follow pan: keep the cursor inside the viewport margin (zoomed or overflowing,
       // where pan has room to move).
       const size = ctx.containerSize();
-      if (size && ctx.canvasZoom > 1) {
-        const displaySize = { width: canvas.width * totalScale, height: canvas.height * totalScale };
+      const displaySize = { width: canvas.width * totalScale, height: canvas.height * totalScale };
+      if (size && (ctx.canvasZoom > 1 || displaySize.height > size.height || displaySize.width > size.width)) {
         const maxPan = maxPanFor(size, displaySize);
         ctx.setCanvasPan(p => {
           const adj = autoFollowPanAdjust({

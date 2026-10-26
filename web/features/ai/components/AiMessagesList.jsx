@@ -521,10 +521,34 @@ export const AiMessagesList = memo(function AiMessagesList({
   // Stable ref callback tracks slot 0 element for scroll anchoring.
   const slot0Ref = useCallback((n) => { topRef.current = n; }, []);
 
+  // The reader's at-bottom verdict for the list that was on screen before this one.
+  // A hydrate rebuilds every id, and the teardown's clamp to top reads as "the reader
+  // left the bottom" — so the verdict rides here across the rebuild instead of
+  // trusting the live flag the clamp scrambled.
+  const prevTailRef = useRef({ id: null, pinned: true });
+
   useEffect(() => {
     const el = scrollRef.current;
-    if (!el || !isAtBottomRef.current) return;
+    const prev = prevTailRef.current;
+    // The key's segments are the id list (ids carry no ":" or "|"), so the tail id
+    // and the survival check read the string this effect already depends on.
+    const lastId = structureKey ? structureKey.split("|").pop().split(":")[0] : null;
+    if (!lastId) {
+      // An empty list is a teardown in flight — keep the verdict for what returns.
+      prevTailRef.current = { id: null, pinned: prev.pinned };
+      return;
+    }
+    // Wholesale rebuild: every id renumbered (hydrate/refresh), or content back from
+    // empty. The scroll the teardown caused is not the reader's — re-pin the tail.
+    const replaced = prev.pinned && (prev.id == null || !structureKey.includes(`${prev.id}:`));
+    prevTailRef.current = { id: lastId, pinned: replaced || isAtBottomRef.current };
+    if (!el) return;
+    if (!replaced && !isAtBottomRef.current) return;
     el.scrollTop = el.scrollHeight;
+    if (replaced) {
+      isAtBottomRef.current = true;
+      setShowScrollBottom(false);
+    }
   }, [structureKey]);
 
   // Streaming text grows in place without changing structure; throttled catch-up, only when pinned at bottom.

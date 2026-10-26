@@ -22,17 +22,25 @@ export function useBrowserTabs(busRef, enabled, profile = "default", windowId = 
 
   useEffect(() => {
     const bus = busRef?.current;
-    // No window yet = this workspace owns no browser tabs: watch nothing (the
-    // null-window push is unfiltered host-side and would leak every window).
+    if (!enabled || !bus?.on) return;
+    // Session adoption: no window remembered locally → ask the HOST which
+    // Chrome window this workspace owns (host is the source of truth, like
+    // terminal's getSessions). Old hosts answer "unknown action" — no-op.
+    if (windowId != null) return;
+    bus.emit("browser:invoke", { action: "window.forWorkspace", payload: { profile, workspaceId: wsId } }, (res) => {
+      const win = Number.isFinite(Number(res?.windowId)) && Number(res.windowId) > 0 ? Number(res.windowId) : null;
+      if (res?.ok && win) useBrowserStore.getState().setWindowFor(wsId, win);
+    });
+  }, [busRef, enabled, profile, windowId, wsId]);
+
+  useEffect(() => {
+    const bus = busRef?.current;
+    // No window yet = this workspace owns no browser tabs so far: watch nothing
+    // (the null-window push is unfiltered host-side and would leak every window).
     if (!enabled || windowId == null || !bus?.on) return;
     const known = new Set();
     let primed = false;
-    const onTabs = (data) => {
-      // Pushes are keyed by profile+window — ignore every other window's tabs.
-      if (data?.profile && data.profile !== profile) return;
-      const pushedWindow = data?.windowId ?? null;
-      if (pushedWindow !== windowId) return;
-      const tabs = Array.isArray(data?.tabs) ? data.tabs : [];
+    const ingest = (tabs) => {
       const st = useBrowserStore.getState();
       // A popup (window.open → openerId set) the page just opened takes over
       // the pane — OAuth flows are unusable any other way on a streamed tab.
@@ -60,11 +68,33 @@ export function useBrowserTabs(busRef, enabled, profile = "default", windowId = 
         st.setActive(wsId, (tabs.find((t) => t.active) || tabs[0]).id);
       }
     };
+    const onTabs = (data) => {
+      // Pushes are keyed by profile+window — ignore every other window's tabs.
+      if (data?.profile && data.profile !== profile) return;
+      const pushedWindow = data?.windowId ?? null;
+      if (pushedWindow !== windowId) return;
+      ingest(Array.isArray(data?.tabs) ? data.tabs : []);
+    };
     bus.on("browser:tabs", onTabs);
-    bus.emit("browser:tabs.watch", { on: true, profile, windowId });
+    bus.emit("browser:tabs.watch", { on: true, profile, workspaceId: wsId, windowId }, (res) => {
+      // The host may have healed our stale window id — follow it and take its
+      // tabs now instead of waiting out the poll tick.
+      if (!res?.ok) return;
+      const resolved = Number.isFinite(Number(res.windowId)) && Number(res.windowId) > 0 ? Number(res.windowId) : null;
+      const st = useBrowserStore.getState();
+      if (resolved && resolved !== windowId) st.setWindowFor(wsId, resolved);
+      // Dead hint and the host owns no window for this workspace: the session
+      // is gone — clear the strip instead of leaving dead tabs behind.
+      if (!resolved) {
+        st.setWindowFor(wsId, null);
+        st.setTabs(wsId, []);
+        st.setActive(wsId, null);
+      }
+      if (Array.isArray(res.tabs) && res.tabs.length) ingest(res.tabs);
+    });
     return () => {
       bus.off?.("browser:tabs", onTabs);
-      bus.emit?.("browser:tabs.watch", { on: false, profile, windowId });
+      bus.emit?.("browser:tabs.watch", { on: false, profile, workspaceId: wsId, windowId });
     };
   }, [busRef, enabled, profile, windowId, wsId]);
 }

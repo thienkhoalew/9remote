@@ -8,6 +8,7 @@ import { PANEL_HEADER_H_CLASS } from "@/shared/constants/layout";
 import { vibrate } from "@/shared/utils/vibration";
 import { RIGHT_PANEL_WIDTH } from "../constants/terminalConfig";
 import { useWorkspaceRepos } from "../hooks/useWorkspaceRepos";
+import { refreshWorkspaceChangedCount } from "../hooks/useWorkspaceChangedCount";
 import { useWorkspaceRoots } from "../hooks/useWorkspaceRoots";
 import { useWorkspaceGit } from "../hooks/useWorkspaceGit";
 import { GIT_REFRESH_EVENT } from "@/features/fileExplorer/constants/fileExplorer.js";
@@ -251,7 +252,13 @@ function TerminalRightPanel({
           <PanelButton
             icon={RefreshCw}
             label={t("workspaces.refreshRepos")}
-            onClick={() => { refresh(); treeActions?.refresh?.(); }}
+            onClick={() => {
+              refresh();
+              treeActions?.refresh?.();
+              // Force (bypass TTL) so the badge numbers go live on this very click.
+              refreshWorkspaceChangedCount(workspacePath);
+              window.dispatchEvent(new Event(GIT_REFRESH_EVENT));
+            }}
             disabled={scanning}
             spinning={scanning}
           />

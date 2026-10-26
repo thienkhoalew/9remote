@@ -34,9 +34,10 @@ export const MARKDOWN_COMPONENTS = {
   ol: tag("ol", "list-decimal pl-5 my-2 space-y-1 text-sm text-text"),
   li: tag("li", "leading-relaxed"),
   blockquote: tag("blockquote", "border-l-4 border-brand-500/40 pl-3.5 my-2.5 text-text-muted italic text-sm"),
-  // Cells wrap rather than scroll: long paths/commands break across lines inside the cell
-  th: tag("th", "border border-border-subtle bg-surface-2 px-3 py-1.5 font-semibold text-left text-text align-top whitespace-normal break-words"),
-  td: tag("td", "border border-border-subtle px-3 py-1.5 text-text align-top whitespace-normal break-words"),
+  // wrap-anywhere shrinks min-content so a long path/URL wraps inside its cell instead of
+  // widening the column; min-w floors each column so many-column tables scroll (see table)
+  th: tag("th", "border border-border-subtle bg-surface-2 px-3 py-1.5 font-semibold text-left text-text align-top wrap-anywhere min-w-[80px]"),
+  td: tag("td", "border border-border-subtle px-3 py-1.5 text-text align-top wrap-anywhere min-w-[80px]"),
   hr: tag("hr", "border-t border-border-subtle my-4"),
   img: ({ alt = "", node: _node, ...props }) => (
     // eslint-disable-next-line @next/next/no-img-element
@@ -54,12 +55,14 @@ export const MARKDOWN_COMPONENTS = {
       {children}
     </a>
   ),
-  // Full-bleed: the table fills the message column and its cells wrap instead of
-  // forcing a horizontal scrollbar.
+  // Fills the message column; auto layout sizes columns by content. When the column
+  // minimums (min-w above) exceed the available width, the wrapper scrolls horizontally.
   table: ({ children, node: _node, ...props }) => (
-    <table className="w-full table-fixed border-collapse border border-border-subtle text-xs my-3" {...props}>
-      {children}
-    </table>
+    <div className="my-3 overflow-x-auto custom-scrollbar">
+      <table className="w-full table-auto border-collapse border border-border-subtle text-xs" {...props}>
+        {children}
+      </table>
+    </div>
   ),
   pre: function PreBlock({ children, node: _node, ...props }) {
     const [copied, setCopied] = useState(false);

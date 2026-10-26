@@ -25,7 +25,8 @@ export function buildConfig(wsConfig, rtcConfig) {
     onDisconnect: wsConfig.onDisconnect,
     onRetryStatus: wsConfig.onRetryStatus,
     onUrlUpdate: wsConfig.onUrlUpdate,
-    onApproval: wsConfig.onApproval
+    onApproval: wsConfig.onApproval,
+    onHostOffline: wsConfig.onHostOffline
   };
 
   const rtcCallbacks = rtcConfig ? {

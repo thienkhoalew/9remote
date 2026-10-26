@@ -1,5 +1,9 @@
 import {
+  CDP_MODIFIER_BITS,
+  EDIT_COMMANDS,
+  KEY_ALIASES,
   KEY_DEFINITIONS,
+  STREAM_CLIPBOARD_MAX_CHARS,
   BROWSER_MOBILE_EMULATION,
   BROWSER_TILE_SIZE,
   STREAM_ACK_DEAD_MS,
@@ -30,6 +34,54 @@ export function cdpTouchPoints(points) {
   return (Array.isArray(points) ? points : []).slice(0, 5)
     .map((p) => ({ x: Number(p?.x) || 0, y: Number(p?.y) || 0 }));
 }
+
+// Modifier names (robotjs style) → CDP bitmask; unknown names are ignored.
+export function cdpModifiers(list) {
+  let mask = 0;
+  for (const m of Array.isArray(list) ? list.slice(0, 4) : []) mask |= CDP_MODIFIER_BITS[String(m).toLowerCase()] || 0;
+  return mask;
+}
+
+// key + modifiers → CDP key event params (null for an unknown key). A ctrl/cmd
+// chord on a letter carries Chrome's editing command; typed chars carry text.
+export function keyEventParams(rawKey, modifiers) {
+  const lower = String(rawKey ?? "").toLowerCase();
+  const mask = cdpModifiers(modifiers);
+  const chord = (mask & 6) !== 0 && (mask & 1) === 0;
+  let def = KEY_DEFINITIONS[KEY_ALIASES[lower] || lower];
+  if (!def && String(rawKey).length === 1) {
+    const ch = String(rawKey);
+    const up = ch.toUpperCase();
+    const isLetter = /[a-z]/i.test(ch);
+    const isDigit = /[0-9]/.test(ch);
+    def = {
+      key: ch,
+      code: isLetter ? `Key${up}` : isDigit ? `Digit${ch}` : "",
+      windowsVirtualKeyCode: isLetter || isDigit ? up.charCodeAt(0) : 0,
+      text: ch
+    };
+  }
+  if (!def) return null;
+  const base = { ...def, nativeVirtualKeyCode: def.windowsVirtualKeyCode, modifiers: mask };
+  if (chord || (mask & 1)) delete base.text;
+  let command = null;
+  if (chord && lower.length === 1) {
+    command = lower === "z" && (mask & 8) ? "redo" : EDIT_COMMANDS[lower] || null;
+    if (command) base.commands = [command];
+  }
+  return { params: base, command };
+}
+
+// Selected text of the focused field/page — what a copy/cut just put on the
+// clipboard. Password fields are never read.
+const SELECTION_EXPRESSION = `(() => {
+  const el = document.activeElement;
+  if (el && /^(INPUT|TEXTAREA)$/.test(el.tagName)) {
+    if (el.type === "password") return "";
+    return String(el.value || "").slice(el.selectionStart || 0, el.selectionEnd || 0);
+  }
+  return String(getSelection() || "");
+})()`;
 
 export function clampViewport(raw = {}) {
   const num = (v, fallback) => {
@@ -502,26 +554,34 @@ export async function dispatchInput(targetId, events) {
   const id = String(targetId || "");
   const prev = inputQueues.get(id) || Promise.resolve();
   const run = prev.catch(() => {}).then(async () => {
-    await dispatchBatch(record, batch);
-    return { dispatched: batch.length };
+    const { clipboard } = await dispatchBatch(record, batch);
+    return clipboard == null ? { dispatched: batch.length } : { dispatched: batch.length, clipboard };
   });
   inputQueues.set(id, run.catch(() => {}));
   return run;
 }
 
+const MOUSE_BUTTON_BITS = { left: 1, right: 2, middle: 4 };
+
 async function dispatchBatch(record, batch) {
+  let clipboard = null;
   for (const evt of batch) {
     const call = record.client.call.bind(record.client);
     const sid = record.sessionId;
     if (evt?.t === "pointer") {
       const type = evt.type === "press" ? "mousePressed"
         : evt.type === "release" ? "mouseReleased" : "mouseMoved";
+      const button = ["left", "right", "middle"].includes(evt.button) ? evt.button : "left";
+      // A move while a button is held is a drag (text selection, sliders).
+      const held = type === "mouseMoved" && evt.drag;
       await call("Input.dispatchMouseEvent", {
         type,
         x: Number(evt.x) || 0,
         y: Number(evt.y) || 0,
-        button: ["left", "right", "middle"].includes(evt.button) ? evt.button : "left",
-        clickCount: Number(evt.clickCount) || 1
+        button: type === "mouseMoved" && !held ? "none" : button,
+        buttons: held ? MOUSE_BUTTON_BITS[button] : 0,
+        clickCount: Number(evt.clickCount) || 1,
+        modifiers: cdpModifiers(evt.modifiers)
       }, sid).catch(() => {});
     } else if (evt?.t === "touch") {
       // Real touch: Chrome synthesizes taps, scrolling and momentum from these.
@@ -531,7 +591,7 @@ async function dispatchBatch(record, batch) {
         touchPoints: type === "touchEnd" ? [] : cdpTouchPoints(evt.points)
       }, sid).catch(() => {});
     } else if (evt?.t === "wheel") {
-      // ctrl+wheel is Chrome's native page zoom — the web pane maps pinch to it.
+      // ctrl+wheel is Chrome's native page zoom.
       await call("Input.dispatchMouseEvent", {
         type: "mouseWheel",
         x: Number(evt.x) || 0,
@@ -545,14 +605,19 @@ async function dispatchBatch(record, batch) {
     } else if (evt?.t === "key") {
       // Proper key/code names + keyDown (not rawKeyDown): Chrome skips the
       // default action (backspace, enter...) when the definition is malformed.
-      const def = KEY_DEFINITIONS[String(evt.key || "").toLowerCase()];
-      if (def) {
-        const base = { ...def, nativeVirtualKeyCode: def.windowsVirtualKeyCode };
-        await call("Input.dispatchKeyEvent", { type: "keyDown", ...base }, sid).catch(() => {});
-        await call("Input.dispatchKeyEvent", { type: "keyUp", ...base }, sid).catch(() => {});
+      const ev = keyEventParams(evt.key, evt.modifiers);
+      if (!ev) continue;
+      // Read BEFORE the chord: cut removes the selection it is about to copy.
+      if (ev.command === "copy" || ev.command === "cut") {
+        const res = await call("Runtime.evaluate", { expression: SELECTION_EXPRESSION, returnByValue: true }, sid).catch(() => null);
+        const text = res?.result?.value;
+        if (typeof text === "string" && text) clipboard = text.slice(0, STREAM_CLIPBOARD_MAX_CHARS);
       }
+      await call("Input.dispatchKeyEvent", { type: "keyDown", ...ev.params }, sid).catch(() => {});
+      await call("Input.dispatchKeyEvent", { type: "keyUp", ...ev.params, commands: undefined }, sid).catch(() => {});
     }
   }
+  return { clipboard };
 }
 
 export function activeStreams() {

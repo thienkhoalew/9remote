@@ -51,7 +51,7 @@ test("config: peerId is unique per instance and injected into socket auth", () =
 });
 
 test("config: callbacks are mapped, rtc callbacks default to empty", () => {
-  const cbs = { onConnect: () => {}, onDisconnect: () => {}, onRetryStatus: () => {}, onUrlUpdate: () => {}, onApproval: () => {} };
+  const cbs = { onConnect: () => {}, onDisconnect: () => {}, onRetryStatus: () => {}, onUrlUpdate: () => {}, onApproval: () => {}, onHostOffline: () => {} };
   const { wsCallbacks, rtcCallbacks } = buildConfig({ ...WS_CFG, ...cbs }, null);
   assert.deepEqual(Object.keys(wsCallbacks).sort(), Object.keys(cbs).sort());
   assert.deepEqual(rtcCallbacks, {});

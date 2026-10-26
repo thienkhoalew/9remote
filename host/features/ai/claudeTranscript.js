@@ -75,18 +75,42 @@ export const isTypedTurn = (record) => {
     && Boolean(text) && !isInjectedTurn(text);
 };
 
+// One read of the transcript for every reader that needs it: a record parsed once,
+// kept beside its line. The live-turn rule, the event walk and the session state all
+// read the same file, and parsing it once per reader cost more than the walk itself.
+export function readTranscript(file) {
+  let raw;
+  try { raw = fs.readFileSync(file, "utf8"); } catch { return { lines: [], records: [] }; }
+  // Walk the string instead of split()ing it: a tens-of-megabytes transcript pays for
+  // every line string it allocates, and only the records are ever read. Empty lines
+  // keep their slot so `records[i]` still lines up with `lines[i]`.
+  const lines = [];
+  const records = [];
+  let start = 0;
+  for (;;) {
+    const nl = raw.indexOf("\n", start);
+    const end = nl === -1 ? raw.length : nl;
+    const line = end > start ? raw.slice(start, end) : "";
+    lines.push(line);
+    if (!line.trim()) records.push(null);
+    else { try { records.push(JSON.parse(line)); } catch { records.push(null); } }
+    if (nl === -1) break;
+    start = nl + 1;
+  }
+  return { lines, records };
+}
+
 // A rewind only moves the leafUuid pointer and leaves dropped turns in the file, and the live branch can be non-contiguous — so keep the parentUuid chain, never a line range.
-function liveTurns(lines, leafOverride = null) {
+function liveTurns(records, leafOverride = null) {
   let leaf = leafOverride;
   // leafOverride: the CLI answers a rewind ~50ms before it flushes the new last-prompt — read as-if-written in that window.
   let lastPointer = -1;
   const byUuid = new Map();
   const at = new Map();
   const turns = [];
-  for (const [index, line] of lines.entries()) {
-    if (!line.trim()) continue;
-    let d;
-    try { d = JSON.parse(line); } catch { continue; }
+  for (let index = 0; index < records.length; index++) {
+    const d = records[index];
+    if (!d) continue;
     if (d.type === "last-prompt" && d.leafUuid) { if (!leafOverride) leaf = d.leafUuid; lastPointer = index; }
     if (!d.uuid) continue;
     byUuid.set(d.uuid, d);
@@ -116,26 +140,168 @@ function liveTurns(lines, leafOverride = null) {
 
 // The ONE place the leaf rule is applied, so the pane and the rewind list cannot disagree on which turns exist.
 export function liveTranscript(file, leafOverride = null) {
-  let lines;
-  try { lines = fs.readFileSync(file, "utf8").trim().split("\n"); } catch { return { lines: [], live: null }; }
-  return { lines, live: liveTurns(lines, leafOverride) };
+  const { lines, records } = readTranscript(file);
+  return { lines, records, live: liveTurns(records, leafOverride) };
 }
+
+// Reopening a chat re-reads the same transcript, and it is usually unchanged since the
+// last look — a reattach after an F5 must still answer, but it need not redo the whole
+// rebuild to do it. Keyed on size+mtime, so any append invalidates it; a file that
+// shrank (a rewind rewrote it) misses too, since the key cannot match.
+//
+// Only the ANSWER is kept: the parsed records are what a cold read produces on its way
+// to it, and holding both doubled what an open chat costs in RAM for a value nothing
+// reads again. A miss re-reads the file, which is exactly when it is needed.
+const TRANSCRIPT_CACHE_MAX = 4;
+const transcriptCache = new Map();
+
+/** The file's cache identity, or null when it cannot be read. */
+function transcriptKey(file) {
+  try {
+    const stat = fs.statSync(file);
+    return `${stat.size}\u0000${stat.mtimeMs}`;
+  } catch {
+    return null;
+  }
+}
+
+function cacheLookup(file, key) {
+  const hit = transcriptCache.get(file);
+  if (!hit || hit.key !== key) return null;
+  // Refresh LRU position.
+  transcriptCache.delete(file);
+  transcriptCache.set(file, hit);
+  return hit;
+}
+
+function cacheStore(file, key, value) {
+  transcriptCache.delete(file);
+  transcriptCache.set(file, { key, ...value });
+  if (transcriptCache.size > TRANSCRIPT_CACHE_MAX) {
+    transcriptCache.delete(transcriptCache.keys().next().value);
+  }
+}
+
+/** Test seam: the cache must never make a stale read look fresh. */
+export function clearTranscriptCache() { transcriptCache.clear(); }
 
 // leafOverride: read as if that pointer were already flushed — see liveTurns.
 export function recoverFromClaudeTranscript(cwd, cliSessionId, startSeq = 1, leafOverride = null) {
+  const bundle = recoverClaudeBundle(cwd, cliSessionId, { startSeq, leafOverride });
+  return bundle?.events || null;
+}
+
+/**
+ * Both readers of one transcript in a single read: the rebuilt event log and the
+ * session state. They always look at the same file, so reading it twice bought
+ * nothing but a second parse of everything the first pass had already decoded.
+ */
+export function recoverClaudeBundle(cwd, cliSessionId, { startSeq = 1, leafOverride = null } = {}) {
   if (!cwd || !cliSessionId) return null;
   if (!CLAUDE_SESSION_ID_RE.test(cliSessionId)) return null;
   const resolved = findTranscript(cwd, cliSessionId);
   if (!resolved) return null;
 
+  // A rewind is rewriting this very file as it asks; the caller needs what is on disk
+  // right now, not what the last open happened to see. It also reads a different
+  // branch than a plain open, so its answer is not the one to cache either.
+  if (leafOverride) {
+    return buildBundle(resolved, readTranscript(resolved).records, leafOverride, startSeq);
+  }
+
+  const key = transcriptKey(resolved);
+  // A file that could not be stat'ed cannot be cached; read it and let the read decide.
+  if (key == null) {
+    const read = readTranscript(resolved);
+    return buildBundle(resolved, read.records, null, startSeq);
+  }
+
+  // The cache stores the ANSWER, not the parse: rebuilding events from unchanged
+  // records is where the remaining time went, so reusing only the records saved half.
+  const hit = cacheLookup(resolved, key);
+  if (hit?.bundle && hit.startSeq === startSeq) return hit.bundle;
+
+  const bundle = buildBundle(resolved, readTranscript(resolved).records, null, startSeq);
+  cacheStore(resolved, key, { bundle, startSeq });
+  return bundle;
+}
+
+function buildBundle(resolved, records, leafOverride, startSeq) {
+  const live = liveTurns(records, leafOverride);
+  const events = buildClaudeEvents(resolved, records, live, startSeq);
+  const state = readClaudeSessionStateFromRecords(records);
+  return events ? { events, state } : { events: null, state };
+}
+
+function buildClaudeEvents(resolved, records, live, startSeq) {
   try {
-    // Same rule the rewind list reads — see liveTranscript.
-    const { lines, live } = liveTranscript(resolved, leafOverride);
     const events = [];
     // Tool calls awaiting their result, by tool_use id — see DIFF_TOOL_SET.
     const toolCalls = new Map();
     let seq = startSeq;
     let cut = false;   // set when the walk passes a turn the branch no longer holds
+
+    // CLI 2.1+: a sub-agent's records live in their own file beside the main one —
+    // <sid>/subagents/agent-*.jsonl — with the spawner's tool_use id in the .meta.json.
+    // Replayed as tool_child/tool_result_child so a reopened chat rebuilds the card tree.
+    const subByTool = new Map();
+    const subsDir = path.join(path.dirname(resolved), path.basename(resolved, ".jsonl"), "subagents");
+    for (const name of readdirOr(subsDir)) {
+      if (!name.endsWith(".meta.json")) continue;
+      try {
+        const meta = JSON.parse(fs.readFileSync(path.join(subsDir, name), "utf8"));
+        const file = path.join(subsDir, name.replace(/\.meta\.json$/, ".jsonl"));
+        if (meta.toolUseId && fs.existsSync(file)) subByTool.set(meta.toolUseId, file);
+      } catch {}
+    }
+    // Tool ids this walk emitted a start for — a sub-agent of a rewound-away turn has no card to nest under.
+    const launchedIds = new Set();
+    const walkedSubs = new Set();
+    const walkSubagent = (file, parent) => {
+      if (walkedSubs.has(file)) return;
+      walkedSubs.add(file);
+      let subLines;
+      try { subLines = fs.readFileSync(file, "utf8").split("\n"); } catch { return; }
+      for (const line of subLines) {
+        if (!line.trim()) continue;
+        let d;
+        try { d = JSON.parse(line); } catch { continue; }
+        const items = d.message?.content;
+        if (!Array.isArray(items)) continue;
+        if (d.type === "assistant") {
+          for (const item of items) {
+            if (item?.type !== "tool_use") continue;
+            toolCalls.set(item.id, { name: item.name, input: item.input });
+            const start = toolStart({ id: item.id, name: item.name, input: item.input, parentToolUseId: parent });
+            start.event = "tool_child";
+            events.push({ seq: seq++, ...start });
+            // A sub-agent may spawn one of its own — its file nests the same way.
+            if (subByTool.has(item.id)) walkSubagent(subByTool.get(item.id), item.id);
+          }
+        } else if (d.type === "user") {
+          for (const tr of items.filter((c) => c?.type === "tool_result")) {
+            const isError = Boolean(tr.is_error);
+            const resultText = typeof tr.content === "string"
+              ? tr.content
+              : (tr.content || []).map((c) => (typeof c === "string" ? c : c?.text || "")).join("");
+            const call = toolCalls.get(tr.tool_use_id);
+            toolCalls.delete(tr.tool_use_id);
+            events.push({
+              seq: seq++,
+              event: "tool_result_child",
+              data: {
+                id: tr.tool_use_id,
+                name: call?.name || "",
+                output: isError ? resultText : collapsePersisted(resultText),
+                error: isError ? resultText : "",
+                status: isError ? "error" : "done",
+                parentToolUseId: parent
+              }
+            });
+          }
+        }
+      }
+    };
 
     // A notification ends the tool row it names — on this door the settle is the row's only end (no watchdog in a replay).
     const pushTaskNotification = (task) => {
@@ -147,10 +313,9 @@ export function recoverFromClaudeTranscript(cwd, cliSessionId, startSeq = 1, lea
       }
     };
 
-    for (const line of lines) {
-      if (!line.trim()) continue;
+    for (const d of records) {
+      if (!d) continue;
       try {
-        const d = JSON.parse(line);
         // A dropped turn takes its answer with it; the cuts interleave, so follow the turns, not one cut point.
         if (live && isTypedTurn(d)) cut = !live.has(d.uuid);
         if (cut) continue;
@@ -200,6 +365,31 @@ export function recoverFromClaudeTranscript(cwd, cliSessionId, startSeq = 1, lea
               if (diff) events.push({ seq: seq++, event: "diff", data: diff });
             }
           }
+        } else if (d.type === "user" && d.isSidechain && d.parent_tool_use_id) {
+          // A sub-agent's tool results nest under their spawner — same wire events the
+          // live door's remap produces (aiSession CHILD_EVENTS), so a reopened chat
+          // rebuilds the card tree instead of dropping the sub-agent's results.
+          const content = Array.isArray(d.message.content) ? d.message.content : [];
+          for (const tr of content.filter((c) => c.type === "tool_result")) {
+            const isError = Boolean(tr.is_error);
+            const resultText = typeof tr.content === "string"
+              ? tr.content
+              : (tr.content || []).map((c) => (typeof c === "string" ? c : c?.text || "")).join("");
+            const call = toolCalls.get(tr.tool_use_id);
+            toolCalls.delete(tr.tool_use_id);
+            events.push({
+              seq: seq++,
+              event: "tool_result_child",
+              data: {
+                id: tr.tool_use_id,
+                name: call?.name || "",
+                output: isError ? resultText : collapsePersisted(resultText),
+                error: isError ? resultText : "",
+                status: isError ? "error" : "done",
+                parentToolUseId: d.parent_tool_use_id
+              }
+            });
+          }
         } else if (d.type === "attachment") {
           // Harness-injected context, slimmed to what the pane can ever draw (see slimAttachmentRecord).
           events.push({
@@ -219,20 +409,31 @@ export function recoverFromClaudeTranscript(cwd, cliSessionId, startSeq = 1, lea
             data: { type: "system", subtype: d.subtype || "", record: d }
           });
         } else if (d.type === "assistant" && d.message) {
+          // A sidechain record is a sub-agent at work: its calls nest (tool_child), and
+          // its thinking/text/turn-end belong to the card, not the main timeline.
+          const parent = d.parent_tool_use_id || "";
           for (const item of d.message.content || []) {
-            if (item.type === "thinking" && item.thinking) {
+            if (item.type === "thinking" && item.thinking && !parent) {
               events.push({ seq: seq++, event: "thinking", data: { text: item.thinking } });
             } else if (item.type === "tool_use") {
               // Held for its result: the diff is built from this call's input — the result carries only the id.
               toolCalls.set(item.id, { name: item.name, input: item.input });
-              events.push({ seq: seq++, ...toolStart({ id: item.id, name: item.name, input: item.input }) });
-            } else if (item.type === "text" && item.text) {
+              const start = toolStart({ id: item.id, name: item.name, input: item.input, parentToolUseId: parent || null });
+              if (parent) start.event = "tool_child";
+              events.push({ seq: seq++, ...start });
+              if (!parent) launchedIds.add(item.id);
+            } else if (item.type === "text" && item.text && !parent) {
               events.push({ seq: seq++, event: "delta", data: { text: item.text } });
             }
           }
-          events.push({ seq: seq++, event: "turn_complete", data: { stats: {} } });
+          if (!parent) events.push({ seq: seq++, event: "turn_complete", data: { stats: {} } });
         }
       } catch {}
+    }
+
+    // Sub-agent files nest after the main walk — every parent card exists before its children arrive.
+    for (const [toolUseId, file] of subByTool) {
+      if (launchedIds.has(toolUseId)) walkSubagent(file, toolUseId);
     }
 
     return events.length > 0 ? events : null;
@@ -242,24 +443,11 @@ export function recoverFromClaudeTranscript(cwd, cliSessionId, startSeq = 1, lea
 }
 
 // The LAST record of each kind wins; absent stays absent so it cannot blank a live value. cost-state is skipped — stale at 0.
-export function readClaudeSessionState(cwd, cliSessionId) {
-  if (!cwd || !cliSessionId) return null;
-  if (!CLAUDE_SESSION_ID_RE.test(cliSessionId)) return null;
-  const file = findTranscript(cwd, cliSessionId);
-  if (!file) return null;
-
-  let raw;
-  try { raw = fs.readFileSync(file, "utf8"); } catch { return null; }
-
+// Reads already-parsed records when a caller has them (one file read serves the rebuild too).
+export function readClaudeSessionStateFromRecords(records) {
   const out = {};
-  for (const line of raw.split("\n")) {
-    if (!line.trim()) continue;
-    // Cheap gate: parsing every line is the expensive part of reading a transcript.
-    if (!line.includes('"permission-mode"') && !line.includes('"ai-title"') &&
-        !line.includes('"last-prompt"') && !line.includes('"attachment"') &&
-        !line.includes('"permissionMode"') && !line.includes('"mode"')) continue;
-    let d;
-    try { d = JSON.parse(line); } catch { continue; }
+  for (const d of records || []) {
+    if (!d) continue;
     switch (d.type) {
       case "permission-mode": if (d.permissionMode) out.permissionMode = d.permissionMode; break;
       // The harness files the mode on every user record too (the TUI's own field), so a
@@ -282,6 +470,28 @@ export function readClaudeSessionState(cwd, cliSessionId) {
     }
   }
   return Object.keys(out).length ? out : null;
+}
+
+export function readClaudeSessionState(cwd, cliSessionId) {
+  if (!cwd || !cliSessionId) return null;
+  if (!CLAUDE_SESSION_ID_RE.test(cliSessionId)) return null;
+  const file = findTranscript(cwd, cliSessionId);
+  if (!file) return null;
+
+  let raw;
+  try { raw = fs.readFileSync(file, "utf8"); } catch { return null; }
+
+  // Cheap gate before parsing: only these record kinds carry state. Kept as a
+  // substring test so a line the walk does not need is never parsed.
+  const records = [];
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) continue;
+    if (!line.includes('"permission-mode"') && !line.includes('"ai-title"') &&
+        !line.includes('"last-prompt"') && !line.includes('"attachment"') &&
+        !line.includes('"permissionMode"') && !line.includes('"mode"')) continue;
+    try { records.push(JSON.parse(line)); } catch {}
+  }
+  return readClaudeSessionStateFromRecords(records);
 }
 
 // stream-json never carries attachments, so tail-read by byte offset; stop before a trailing line still being written.

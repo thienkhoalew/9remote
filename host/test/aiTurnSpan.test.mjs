@@ -60,10 +60,12 @@ await test("a reset states the log's own turn state — the client clears it a f
   s.onEvent = (id, event, data) => { if (event === "conversation_reset") seen.push(data); };
   s.lastTurnMs = 1500;
   s.cliSessionId = "fake-id";
-  s._rebuildFromStore = () => [
-    { seq: 1, event: "user_message", data: { text: "hi" } },
-    { seq: 2, event: "turn_complete", data: {} }
-  ];
+  s._rebuildFromStore = () => ({
+    events: [
+      { seq: 1, event: "user_message", data: { text: "hi" } },
+      { seq: 2, event: "turn_complete", data: {} }
+    ]
+  });
   assert.equal(s.refreshFromStore(), true);
   assert.equal(seen.at(-1).lastTurnMs, 1500);
   assert.equal(s.lastTurnMs, 1500);
@@ -73,7 +75,7 @@ await test("a F5 mid-turn resets to RUNNING, with the duration to count from", (
   const s = makeSession();
   s.onEvent = () => {};
   s.cliSessionId = "fake-id";
-  s._rebuildFromStore = () => [{ seq: 1, event: "user_message", data: { text: "hi" } }];
+  s._rebuildFromStore = () => ({ events: [{ seq: 1, event: "user_message", data: { text: "hi" } }] });
   s.isTurnRunning = true;
   s.turnStartedAt = Date.now() - 5000;
   const reset = [];
@@ -230,7 +232,7 @@ await test("harness records survive a hydrate's rebuild", () => {
   const s = makeSession();
   s.onEvent = () => {};
   s.cliSessionId = "fake";
-  s._rebuildFromStore = () => [{ seq: 1, event: "user_message", data: { text: "hi" } }];
+  s._rebuildFromStore = () => ({ events: [{ seq: 1, event: "user_message", data: { text: "hi" } }] });
 
   s.emitNormalized("cli_event", { type: "system", subtype: "task_started", record: { task_id: "t-1", is_backgrounded: true } });
   assert.equal(s.history.filter((e) => e.event === "cli_event").length, 1, "recorded while live");
@@ -244,11 +246,13 @@ await test("a carried record keeps its place in the conversation", () => {
   const s = makeSession();
   s.onEvent = () => {};
   s.cliSessionId = "fake";
-  s._rebuildFromStore = () => [
-    { seq: 1, event: "user_message", data: { text: "turn 1" } },
-    { seq: 2, event: "turn_complete", data: {} },
-    { seq: 3, event: "user_message", data: { text: "turn 2" } }
-  ];
+  s._rebuildFromStore = () => ({
+    events: [
+      { seq: 1, event: "user_message", data: { text: "turn 1" } },
+      { seq: 2, event: "turn_complete", data: {} },
+      { seq: 3, event: "user_message", data: { text: "turn 2" } }
+    ]
+  });
   s.emitNormalized("user_message", { text: "turn 1" });
   s.emitNormalized("turn_complete", { stats: {} });
   s.emitNormalized("cli_event", { type: "system", subtype: "task_notification", record: { task_id: "t-old", status: "completed" } });
@@ -267,10 +271,10 @@ await test("a shorter rebuild does not duplicate or pile up the carried records"
   s.onEvent = () => {};
   s.cliSessionId = "fake";
   s.emitNormalized("user_message", { text: "u1" });
-  s.emitNormalized("cli_event", { type: "system", subtype: "informational", record: { content: "noteA" } });
+  s.emitNormalized("cli_event", { type: "system", subtype: "task_notification", record: { content: "noteA" } });
   s.emitNormalized("user_message", { text: "u2" });
-  s.emitNormalized("cli_event", { type: "system", subtype: "informational", record: { content: "noteB" } });
-  s._rebuildFromStore = () => [{ seq: 1, event: "user_message", data: { text: "u2" } }];
+  s.emitNormalized("cli_event", { type: "system", subtype: "task_notification", record: { content: "noteB" } });
+  s._rebuildFromStore = () => ({ events: [{ seq: 1, event: "user_message", data: { text: "u2" } }] });
   s.refreshFromStore();
 
   const notes = s.history.filter((e) => e.event === "cli_event").map((e) => e.data.record.content);
