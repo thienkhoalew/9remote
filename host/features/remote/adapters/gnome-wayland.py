@@ -65,7 +65,7 @@ class Bridge:
         sc = self.call(SC, '/org/gnome/Mutter/ScreenCast', SC, 'CreateSession',
                        '(a{sv})', ({'remote-desktop-session-id': GLib.Variant('s', session_id)},))[0]
         self.stream = self.call(SC, sc, SC + '.Session', 'RecordMonitor', '(sa{sv})',
-                                ('', {'cursor-mode': GLib.Variant('u', 1)}))[0]
+                                ('', {'cursor-mode': GLib.Variant('u', 0)}))[0]
         self.bus.signal_subscribe(SC, SC + '.Stream', 'PipeWireStreamAdded', self.stream,
                                   None, Gio.DBusSignalFlags.NONE, self.pipewire_ready)
         self.bus.signal_subscribe(RD, RD + '.Session', 'Closed', self.rd,
