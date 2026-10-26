@@ -38,7 +38,7 @@ Use the standard host CLI/web pairing flow; no web client changes are required.
 
 - GNOME/Mutter only, primary monitor, maximum 15 captured frames/sec.
 - Shares the existing unlocked GNOME session; not a login-screen/unlock service.
-- Pointer is embedded in captured frames. Monitor changes while connected require reconnecting.
+- The host pointer is hidden in captured frames; the web client draws its local pointer. Monitor changes while connected require reconnecting.
 - Unicode text is pasted through the GNOME clipboard API (it replaces clipboard text).
 - Live capture, restart, GTK click, and Vietnamese text input have been verified.
   Mobile web pointer, drag, and scroll behavior still need device acceptance testing.
@@ -47,8 +47,8 @@ Use the standard host CLI/web pairing flow; no web client changes are required.
 
 `9remote` resolves to `~/.local/bin/9remote`, launching the isolated fork runtime
 in `~/.local/share/9remote-wayland/`. `9remote --version` prints
-`3.0.40-wayland.1`. This identifies a fork of the current published GitHub source,
-not npm's independently versioned official 3.0.43 package. Official registry update
+`3.0.43-wayland.1`. This includes upstream main through `29ff890` and retains
+the GNOME Wayland backend. Official registry update
 checks are disabled for `-wayland.` builds so an update cannot replace the patch.
 
 The unchanged web client at `9remote.cc` can pair with this host using its connect
