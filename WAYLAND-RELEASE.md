@@ -9,17 +9,17 @@ Install Node.js 22 or newer and these Ubuntu packages:
 sudo apt install python3-gi gir1.2-gstreamer-1.0 gstreamer1.0-pipewire gstreamer1.0-plugins-base
 ```
 
-Download `9remote-wayland-3.0.43-linux-x64.tar.gz` from the release, then:
+Download `9remote-wayland-3.0.56-linux-x64.tar.gz` from the release, then:
 
 ```sh
-tar -xzf 9remote-wayland-3.0.43-linux-x64.tar.gz
-cd 9remote-wayland-3.0.43-linux-x64
+tar -xzf 9remote-wayland-3.0.56-linux-x64.tar.gz
+cd 9remote-wayland-3.0.56-linux-x64
 ./install.sh
 ~/.local/bin/9remote --version
 ~/.local/bin/9remote
 ```
 
-Expected version: `3.0.43-wayland.1`. If `~/.local/bin` is on `PATH`, use
+Expected version: `3.0.56-wayland.1`. If `~/.local/bin` is on `PATH`, use
 `9remote` directly. The installer saves a prior fork runtime beside the new one
 with a timestamp. User pairing data in `~/.9remote` is untouched.
 

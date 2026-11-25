@@ -47,7 +47,7 @@ Use the standard host CLI/web pairing flow; no web client changes are required.
 
 `9remote` resolves to `~/.local/bin/9remote`, launching the isolated fork runtime
 in `~/.local/share/9remote-wayland/`. `9remote --version` prints
-`3.0.43-wayland.1`. This includes upstream main through `29ff890` and retains
+`3.0.56-wayland.1`. This includes upstream main through `e99bcff` and retains
 the GNOME Wayland backend. Official registry update
 checks are disabled for `-wayland.` builds so an update cannot replace the patch.
 

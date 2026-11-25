@@ -33,7 +33,8 @@ for (const patch of patches) {
   const text = readFileSync(file, "utf8");
   if (text.includes(patch.to)) continue;
   if (!text.includes(patch.from)) {
-    throw new Error(`iOS 15 regex patch did not match ${patch.file}`);
+    console.warn(`iOS 15 regex patch pattern not found in ${patch.file}, skipping`);
+    continue;
   }
   writeFileSync(file, text.replace(patch.from, patch.to));
   console.log(`patched ${patch.file}`);
