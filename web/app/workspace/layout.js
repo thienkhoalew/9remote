@@ -10,11 +10,13 @@ import { useUIStore } from "@/shared/stores/uiStore";
 import { useFileBus } from "@/features/fileExplorer/hooks/useFileBus";
 import DevTermLog from "@/features/terminal/components/DevTermLog";
 import { getRecentWorkspaces, addRecentWorkspace, updateOpenedFiles } from "@/features/fileExplorer/components/WorkspaceList";
+import { clearAiCache } from "@/features/ai/lib/aiCacheStore";
 import { isDiffPath, parseRepoDiffPath } from "@/features/fileExplorer/constants/fileExplorer";
 import { useSlideMenuStore } from "@/shared/stores/slideMenuStore";
 import { useNotification } from "@/shared/hooks/useNotification";
 import { updateTitle } from "@/shared/utils/titleMarquee";
 import { installTapClickFix } from "@/shared/utils/tapClickFix";
+import { reloadWhenHostReady } from "@/shared/utils/hostReady";
 import { startWidthDrag } from "@/shared/utils/dragResize";
 import { DESKTOP_BREAKPOINT } from "@/features/terminal/constants/terminalConfig";
 import { usePwaInstallInit } from "@/features/terminal/hooks/usePwaInstallInit";
@@ -32,7 +34,8 @@ import { useAgentClis } from "@/features/terminal/hooks/useAgentClis";
 import { useMobileDeviceWatch } from "@/features/mobile/hooks/useMobileDeviceWatch";
 import { loadTerminalPrefs, applySkipPermissions } from "@/features/terminal/constants/agentCli";
 import { sessionWorkspaceId } from "@/features/terminal/lib/paneLayout";
-import { AI_UI_OPTIONS } from "@/features/ai/constants";
+import { AI_UI_OPTIONS, chatCanvasStyle } from "@/features/ai/constants";
+import { useTheme } from "@/shared/theme/ThemeProvider";
 import TerminalWorkspace from "@/features/terminal/components/TerminalWorkspace";
 import ReconnectScreen from "@/features/session/components/ReconnectScreen";
 import AnimatedBackground from "@/features/landing/components/AnimatedBackground";
@@ -48,6 +51,8 @@ import { connOf, useAllSessionStatus } from "@/shared/transport/hostConn";
 import { useAttentionCycle } from "@/features/terminal/hooks/useAttentionCycle";
 import { useApiKeyStorage, KEYS_CHANGED_EVENT } from "@/shared/hooks/useApiKeyStorage";
 import RemoteDesktop from "@/features/remote/components/RemoteDesktop";
+import RemoteUnavailable from "@/features/remote/components/RemoteUnavailable";
+import RemoteHostPicker from "@/features/remote/components/RemoteHostPicker";
 import MobileMirror from "@/features/mobile/components/MobileMirror";
 import BrowserPane from "@/features/browser/components/BrowserPane";
 import { useBrowserStore } from "@/shared/stores/browserStore";
@@ -64,6 +69,8 @@ import ShortcutsModal from "@/shared/components/ui/ShortcutsModal";
 import ConnectionModal from "@/shared/components/ui/ConnectionModal";
 import ConfirmDialog from "@/shared/components/ui/ConfirmDialog";
 import SlideMenu from "@/shared/components/ui/SlideMenu";
+import BottomNav, { DOCK_TAB_OF } from "@/shared/components/ui/BottomNav";
+import TabPanel from "@/shared/components/ui/TabPanel";
 import PendingDeviceApprovalModal from "@/features/session/components/PendingDeviceApprovalModal";
 import { useI18n } from "@/shared/i18n";
 import { useRouteSync } from "@/shared/hooks/useRouteSync";
@@ -79,16 +86,20 @@ function RouteSyncTracker({ hydrated, apiKey }) {
 // Workspace shell - holds the bus/state/views; child routes are URL markers only
 export default function WorkspaceLayout({ children }) {
   const { t } = useI18n();
+  const { theme } = useTheme();
   const [hydrated, setHydrated] = useState(false);
   // Capture PWA beforeinstallprompt as early as possible (Chromium-only)
   usePwaInstallInit();
 
   const {
     viewStack,
+    agentBySession,
     openedSessions,
     pushView,
     popView: storePopView,
     setViewStack,
+    selectTab,
+    navDir,
     addOpenedSession,
     removeOpenedSession,
     reorderOpenedSessions,
@@ -135,6 +146,8 @@ export default function WorkspaceLayout({ children }) {
     pushView: s.pushView,
     popView: s.popView,
     setViewStack: s.setViewStack,
+    selectTab: s.selectTab,
+    navDir: s.navDir,
     addOpenedSession: s.addOpenedSession,
     removeOpenedSession: s.removeOpenedSession,
     reorderOpenedSessions: s.reorderOpenedSessions,
@@ -175,6 +188,7 @@ export default function WorkspaceLayout({ children }) {
     artifactTitle: s.artifactTitle,
     pushArtifact: s.pushArtifact,
     removeArtifact: s.removeArtifact,
+    agentBySession: s.agentBySession,
   })));
 
   const router = useRouter();
@@ -219,7 +233,7 @@ export default function WorkspaceLayout({ children }) {
     if (!window.__TAURI__) return;
     const onKey = (e) => {
       const isReload = e.key === "F5" || ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "r");
-      if (isReload) { e.preventDefault(); window.location.reload(); }
+      if (isReload) { e.preventDefault(); reloadWhenHostReady(); }
     };
     const onContextMenu = (e) => {
       const tag = e.target?.tagName;
@@ -325,7 +339,7 @@ export default function WorkspaceLayout({ children }) {
       // reconnects — settle a beat later so the comparison sees it.
       const timer = setTimeout(() => {
         const h = useFleetStore.getState().hosts[currentFleetKey];
-        if (h?.version && snap.version && h.version !== snap.version) window.location.reload();
+        if (h?.version && snap.version && h.version !== snap.version) reloadWhenHostReady();
         else useFleetStore.getState()._patchHost(currentFleetKey, { updating: false });
       }, 1500);
       return () => clearTimeout(timer);
@@ -587,6 +601,7 @@ export default function WorkspaceLayout({ children }) {
     toggleRightPanel,
     palette: () => { if (paletteWorkspace) setQuickOpen(true); },
     attentionNext: jumpToNextWaiting,
+    reloadApp: () => reloadWhenHostReady(),
     help: openShortcutsModal
   }, isDesktop && isTerminalView);
 
@@ -793,6 +808,7 @@ export default function WorkspaceLayout({ children }) {
   // Which host a remote-desktop / mobile-mirror view targets (null = the active
   // host). Same components, same flow — only the conn underneath changes.
   const [remoteHead, setRemoteHead] = useState(null);
+  const [remotePicker, setRemotePicker] = useState(false);
   const [mobileHead, setMobileHead] = useState(null);
   const remoteConn = connOf(remoteHead || currentFleetKey || null);
   const mobileConn = connOf(mobileHead || currentFleetKey || null);
@@ -801,10 +817,50 @@ export default function WorkspaceLayout({ children }) {
   // "full" is the viewed host's status — same live wire as "online", seen from the front seat.
   const rowLive = (row) => row?.status === "online" || row?.status === "full";
 
+  // A live host that cannot serve remote still has to answer the dock: the remote
+  // screen becomes the host's own guidance (what is missing + which host is ready).
+  const remoteTargetRow = remoteHead ? remoteHostRow : mainHost;
+  const remoteTargetLive = remoteHead ? rowLive(remoteHostRow) : connected;
+  const remoteGuide = remoteTargetLive && !remoteTargetRow?.remoteAvailable;
+  const otherReadyRemoteHosts = useMemo(() => {
+    const live = (h) => h.status === "online" || h.status === "full";
+    return Object.values(fleetHostsMap).filter(
+      (h) => h.key !== (remoteHead || currentFleetKey) && live(h) && h.remoteAvailable
+    );
+  }, [fleetHostsMap, remoteHead, currentFleetKey]);
+
+  // Hosts the phone dock's Remote tab can land on — the sheet is their list.
+  const remoteReadyHosts = useMemo(
+    () => Object.values(fleetHostsMap).filter((h) => rowLive(h) && h.remoteAvailable),
+    [fleetHostsMap]
+  );
+
   const handleOpenRemote = useCallback((head = null) => {
     setRemoteHead(head);
     pushView({ type: "remote" });
   }, [pushView]);
+
+  // Dock tab: one ready host goes straight in, several open the picker, none
+  // falls through to the active host's own guidance screen.
+  const openRemoteTab = useCallback(() => {
+    if (remoteReadyHosts.length > 1) { setRemotePicker(true); return; }
+    setRemoteHead(remoteReadyHosts[0]?.key || null);
+    selectTab({ type: "remote" });
+  }, [remoteReadyHosts, selectTab]);
+
+  const pickRemoteHost = useCallback((key) => {
+    setRemotePicker(false);
+    setRemoteHead(key);
+    selectTab({ type: "remote" });
+  }, [selectTab]);
+
+  // Opened from a view (terminal/list) remote is a pushed screen, so Back returns to
+  // it; opened from the phone's dock it is a tab, so Back leaves to the session list.
+  const closeRemote = useCallback(() => {
+    setRemoteHead(null);
+    if (viewStack.length > 1) return popView();
+    selectTab({ type: "list" });
+  }, [viewStack, popView, selectTab]);
 
   // Desktop keeps the mirror beside the terminal (float / pinned / PiP); a phone
   // has no room to split, so it stays a full-screen view there.
@@ -837,6 +893,8 @@ export default function WorkspaceLayout({ children }) {
     // clearAuth, not a bare sessionStorage.clear — an explicit logout must also
     // drop the remembered login, or the next visit walks straight back in.
     clearAuth();
+    // Chat content cached on this device must not outlive the session that read it.
+    clearAiCache();
     sessionStorage.setItem("9remote_manual_disconnect", "1");
     window.location.replace("/login");
   }, [resetStore, clearAuth]);
@@ -939,12 +997,31 @@ export default function WorkspaceLayout({ children }) {
     return <ReconnectScreen label={t("workspace.loading")} />;
   }
 
+  // Full-screen wait state: the gate owns the shell, so shell chrome (the phone
+  // dock) stays out of it instead of floating above the overlay.
+  const shellGateOpen = (!connected || !admitted) && !mainHostUpdating && !deliberatelyOff;
+
   const remoteEntry = connected && remoteAvailable ? handleOpenRemote : null;
   const mobileEntry = connected && mobileAvailable ? handleOpenMobile : null;
+
+  // Screens whose canvas is the chat canvas: the session list, and a chat-UI session
+  // (its pane goes transparent so this is the only layer). Both paint it full-bleed
+  // here, outside .terminal-container, so it also covers the safe area.
+  const shellCanvas = !isDesktop && (
+    currentView.type === "list" ||
+    (currentView.type === "terminal" && !!agentBySession?.[currentView.sessionId]?.endsWith("-ui"))
+  );
 
   return (
     <>
       <AnimatedBackground />
+      {shellCanvas && (
+        <div
+          aria-hidden
+          className="fixed inset-0 pointer-events-none"
+          style={{ ...chatCanvasStyle(theme), zIndex: -9 }}
+        />
+      )}
       <Suspense fallback={null}>
         <RouteSyncTracker hydrated={hydrated} apiKey={auth?.apiKey} />
       </Suspense>
@@ -953,12 +1030,7 @@ export default function WorkspaceLayout({ children }) {
             and terminals with more operations, so this would be a weaker copy of it, and
             the bottom of the stack goes straight to the terminal view instead. */}
         {!isDesktop && (
-        <div
-          className={`absolute inset-0 transition-opacity duration-150 ease-out ${currentView.type === "list"
-            ? "opacity-100 z-10"
-            : "opacity-0 z-0 pointer-events-none"
-            }`}
-        >
+        <TabPanel active={currentView.type === "list"} dir={navDir} className="z-10">
           <SessionList
             sessions={sessions}
             cwdBySession={cwdBySession}
@@ -995,7 +1067,7 @@ export default function WorkspaceLayout({ children }) {
             onMainDisconnect={onMainDisconnect}
             onMainReconnect={onMainReconnect}
           />
-        </div>
+        </TabPanel>
         )}
 
         {/* Terminal view: shared header + multi-pane layout. Always mounted on desktop —
@@ -1092,16 +1164,67 @@ export default function WorkspaceLayout({ children }) {
         )}
 
         {/* Remote Desktop — rides the chosen host's conn (default: active) */}
-        {currentView.type === "remote" && (
+        {/* Remote is a dock TAB on a phone (sibling of the list and settings) and a
+            pushed screen on desktop (where it opens beside the terminal). TabPanel on
+            the phone gives it the same switch motion; desktop keeps its own slide. */}
+        {!isDesktop && (
+          <TabPanel active={currentView.type === "remote"} dir={navDir} className="z-20">
+            {/* Mount on demand: the stream starts on mount, so keeping it mounted here
+                would capture the host screen while the user is on another tab. */}
+            {currentView.type === "remote" && (remoteGuide ? (
+              <RemoteUnavailable
+                hostLabel={remoteTargetRow?.label}
+                status={remoteTargetRow?.remoteStatus || null}
+                platform={remoteTargetRow?.platform || platform}
+                hosts={otherReadyRemoteHosts}
+                onOpenHost={(key) => setRemoteHead(key)}
+                onBack={closeRemote}
+                canvasStyle={chatCanvasStyle(theme)}
+              />
+            ) : (
+              <RemoteDesktop
+                key={remoteHead || currentFleetKey || "main"}
+                onClose={closeRemote}
+                busRef={remoteConn.busRef}
+                protocolRef={remoteConn.pmRef}
+                connected={remoteHead ? rowLive(remoteHostRow) : connected}
+                carrier={remoteHead ? (remoteHostRow?.carrier || "ws") : carrier}
+                hostPlatform={remoteHostRow?.platform || platform}
+                hostLabel={remoteTargetRow?.label}
+                remoteStatus={remoteTargetRow?.remoteStatus || null}
+                otherReadyHosts={otherReadyRemoteHosts}
+                onOpenHost={(key) => setRemoteHead(key)}
+                canvasStyle={chatCanvasStyle(theme)}
+              />
+            ))}
+          </TabPanel>
+        )}
+        {isDesktop && currentView.type === "remote" && (
           <div className="absolute inset-0 z-20 transition-all duration-300 ease-out">
-            <RemoteDesktop
-              onClose={() => { setRemoteHead(null); popView(); }}
-              busRef={remoteConn.busRef}
-              protocolRef={remoteConn.pmRef}
-              connected={remoteHead ? rowLive(remoteHostRow) : connected}
-              carrier={remoteHead ? (remoteHostRow?.carrier || "ws") : carrier}
-              hostPlatform={remoteHostRow?.platform || platform}
-            />
+            {remoteGuide ? (
+              <RemoteUnavailable
+                hostLabel={remoteTargetRow?.label}
+                status={remoteTargetRow?.remoteStatus || null}
+                platform={remoteTargetRow?.platform || platform}
+                hosts={otherReadyRemoteHosts}
+                onOpenHost={(key) => setRemoteHead(key)}
+                onBack={closeRemote}
+              />
+            ) : (
+              <RemoteDesktop
+                key={remoteHead || currentFleetKey || "main"}
+                onClose={closeRemote}
+                busRef={remoteConn.busRef}
+                protocolRef={remoteConn.pmRef}
+                connected={remoteHead ? rowLive(remoteHostRow) : connected}
+                carrier={remoteHead ? (remoteHostRow?.carrier || "ws") : carrier}
+                hostPlatform={remoteHostRow?.platform || platform}
+                hostLabel={remoteTargetRow?.label}
+                remoteStatus={remoteTargetRow?.remoteStatus || null}
+                otherReadyHosts={otherReadyRemoteHosts}
+                onOpenHost={(key) => setRemoteHead(key)}
+              />
+            )}
           </div>
         )}
 
@@ -1124,14 +1247,14 @@ export default function WorkspaceLayout({ children }) {
         {/* Paired Device (mobile): full-screen dashboard. Desktop renders it inside
             TerminalWorkspace's content area so the sidebar stays up. */}
         {!isDesktop && currentView.type === "pair" && (
-          <div className="absolute inset-0 z-20 transition-all duration-300 ease-out">
+          <div className="absolute inset-0 z-20 transition-all duration-300 ease-out screen-in">
             <AgentDashboardView />
           </div>
         )}
 
         {/* Workspace List */}
         {currentView.type === "workspaces" && (
-          <div className="absolute inset-0 z-20 transition-all duration-300 ease-out">
+          <div className="absolute inset-0 z-20 transition-all duration-300 ease-out screen-in">
             <WorkspaceList
               onSelect={handleSelectWorkspace}
               onBrowse={handleBrowseFolder}
@@ -1144,7 +1267,7 @@ export default function WorkspaceLayout({ children }) {
 
         {/* Browse Folder (selecting a workspace) */}
         {currentView.type === "browse" && (
-          <div className="absolute inset-0 z-20 transition-all duration-300 ease-out">
+          <div className="absolute inset-0 z-20 transition-all duration-300 ease-out screen-in">
             <FileExplorer
               scope={connScope}
               workspace={currentView.path}
@@ -1169,7 +1292,7 @@ export default function WorkspaceLayout({ children }) {
           // file outright; otherwise restore the workspace's last open tabs.
           const routeFile = currentView.type === "editor" ? currentView.path : null;
           return (
-            <div className="absolute inset-0 z-20 transition-all duration-300 ease-out">
+            <div className="absolute inset-0 z-20 transition-all duration-300 ease-out screen-in">
               <FileWorkspaceDesktop
                 key={ws}
                 workspace={ws}
@@ -1194,7 +1317,7 @@ export default function WorkspaceLayout({ children }) {
 
         {/* File Explorer (workspace mode) — mobile only */}
         {!isDesktop && currentView.type === "files" && (
-          <div className="absolute inset-0 z-20 transition-all duration-300 ease-out">
+          <div className="absolute inset-0 z-20 transition-all duration-300 ease-out screen-in">
             <FileExplorer
               scope={connScope}
               workspace={currentView.workspace}
@@ -1212,7 +1335,7 @@ export default function WorkspaceLayout({ children }) {
 
         {/* Git Panel — mobile only */}
         {!isDesktop && currentView.type === "git" && (
-          <div className="absolute inset-0 z-30 transition-all duration-300 ease-out">
+          <div className="absolute inset-0 z-30 transition-all duration-300 ease-out screen-in">
             <GitPanel
               workspace={currentView.workspace}
               fileBus={fileBus}
@@ -1225,7 +1348,7 @@ export default function WorkspaceLayout({ children }) {
         {/* Mobile editor overlay — above whichever view opened it (files or git), so Back (X)
             returns to that view without a viewStack push. */}
         {!isDesktop && mobileEditor && (
-          <div className="absolute inset-0 z-40 transition-all duration-300 ease-out">
+          <div className="absolute inset-0 z-40 transition-all duration-300 ease-out screen-in">
             <FileEditor
               filePath={mobileEditor.path}
               line={mobileEditor.line}
@@ -1250,12 +1373,33 @@ export default function WorkspaceLayout({ children }) {
             carries the progress instead. ReconnectScreen carries the reload
             escape hatch after RELOAD_TIMEOUT_MS so a wedged retry is never a
             dead spinner. */}
-        {(!connected || !admitted) && !mainHostUpdating && !deliberatelyOff && <ReconnectScreen />}
+        {shellGateOpen && <ReconnectScreen />}
 
         {!mainHostUpdating && <ConnectionModal retryStatus={retryStatus} approvalStatus={approvalStatus} connected={connected} hostOffline={hostOffline} suppress={resumeGrace} firstConnect={!everConnected} onLogout={handleDisconnect} onRetryNow={handleRetryNow} />}
 
         {/* Global Slide Menu — single instance at page level */}
         <SlideMenu />
+
+        {/* Phone tab bar. One instance for the whole shell: the three dock tabs are
+            siblings, so switching between them must not mount or unmount the bar.
+            Hidden on a terminal (that view owns its own bottom strip) and while the
+            connection gate is up (it is shell chrome, not part of the wait state). */}
+        {!isDesktop && !shellGateOpen && (currentView.type === "list" || currentView.type === "settings") && (
+          <BottomNav
+            active={DOCK_TAB_OF[currentView.type] || "sessions"}
+            onSessions={() => selectTab({ type: "list" })}
+            onRemote={openRemoteTab}
+            onMenu={openSlideMenu}
+          />
+        )}
+        {/* Phone dock asked which host to mirror */}
+        {remotePicker && (
+          <RemoteHostPicker
+            hosts={remoteReadyHosts}
+            onPick={pickRemoteHost}
+            onClose={() => setRemotePicker(false)}
+          />
+        )}
         {/* Host-env approval gate — a new device asking in pops the modal on any view */}
         <PendingDeviceApprovalModal />
 

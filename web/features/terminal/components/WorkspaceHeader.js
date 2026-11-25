@@ -5,8 +5,10 @@ import { vibrate } from "@/shared/utils/vibration";
 import { useI18n } from "@/shared/i18n";
 import IconMenu from "@/shared/components/ui/IconMenu";
 import { useWorkspaceGit } from "../hooks/useWorkspaceGit";
+import { useWorkspaceChangedCount } from "../hooks/useWorkspaceChangedCount";
 import { workspaceGitPath } from "../lib/workspaceGrouping";
 import { isDefaultBranch } from "../constants/terminalConfig";
+import { statusCounts, statusVisual } from "@/shared/utils/statusVisual";
 import BranchBadge from "./BranchBadge";
 
 // Hidden until the row is hovered on pointer devices; dimmed but visible on touch.
@@ -21,13 +23,22 @@ export default function WorkspaceHeader({
   workspace, isActive, connected, collapsed, fileBus,
   onToggleCollapse, onSelect, onNewTerminal, onDelete, onRename,
   onAddWorkspace = null,
+  statusMap = null,
   mobile = false
 }) {
   const { t } = useI18n();
   const gitPath = workspaceGitPath(workspace);
   // No fileBus (another host's tree) must NOT fall back to the main host's bus —
   // that would scan this workspace's path on the wrong machine.
-  const { branch, dirty } = useWorkspaceGit(gitPath, fileBus, { enabled: !!fileBus });
+  const { branch } = useWorkspaceGit(gitPath, fileBus, { enabled: !!fileBus });
+  // Dirty dot is derived from the same count snapshot as the pane and git panel badges.
+  const { count } = useWorkspaceChangedCount(gitPath, fileBus, { enabled: !!fileBus });
+  const dirty = count > 0;
+  // A closed workspace still has to answer "what's running in here?" — one dot per
+  // present state, in the same language as a session row's dot.
+  const rolled = !collapsed
+    ? []
+    : statusCounts((workspace.items || []).map((s) => statusMap?.[s.id]?.state));
 
   // The row itself toggles expand/collapse, matching the chevron behavior.
   const rowClick = onToggleCollapse ? () => { vibrate(); onToggleCollapse(); } : onSelect;
@@ -35,9 +46,9 @@ export default function WorkspaceHeader({
   return (
     <div
       onClick={rowClick}
-      className={`relative pr-2 py-1.5 flex items-center gap-1.5 group group/grp transition-colors ${
-        rowClick ? "cursor-pointer hover:bg-text/[0.06]" : ""
-      }`}
+      className={`relative pr-2 flex items-center gap-1.5 group group/grp transition-colors ${
+        mobile ? "py-1 mt-1" : "py-1.5"
+      } ${rowClick ? "cursor-pointer hover:bg-text/[0.06]" : ""}`}
     >
       <button
         onClick={(e) => { e.stopPropagation(); vibrate(); onToggleCollapse?.(); }}
@@ -48,8 +59,30 @@ export default function WorkspaceHeader({
       </button>
       <Folder size={mobile ? 14 : 13.5} className="text-text-muted flex-shrink-0" />
       <span className="flex-1 min-w-0 flex flex-col">
-        <span className={`${mobile ? "text-sm" : "text-[12px]"} font-medium uppercase truncate ${isActive ? "text-text" : "text-text-muted"}`} data-tip={workspace.name}>
-          {workspace.name}
+        <span className={`flex items-center gap-1.5 min-w-0 ${isActive ? "text-text" : "text-text-muted"}`}>
+          <span
+            className={`font-medium uppercase truncate ${
+              mobile
+                ? `text-[13px] tracking-wide ${isActive ? "text-text" : "text-text/90"}`
+                : `text-[12px] ${isActive ? "text-text" : "text-text-muted"}`
+            }`}
+            data-tip={workspace.name}
+          >
+            {workspace.name}
+          </span>
+          {rolled.map(({ state, count }) => {
+            const v = statusVisual(state);
+            return (
+              <span
+                key={state}
+                className="flex items-center gap-0.5 flex-shrink-0"
+                title={`${t(v.label)}${count > 1 ? ` ×${count}` : ""}`}
+              >
+                <span className={`w-2 h-2 rounded-full term-dot ${v.cls}${v.pulse ? ` pulse-${v.pulse}` : ""}`} style={{ background: v.dot }} />
+                {count > 1 && <span className="text-[10px] text-text-subtle leading-none">{count}</span>}
+              </span>
+            );
+          })}
         </span>
         {/* Path is dropped and a default branch stays hidden — only an off-default
             worktree is worth a second line. Never repeats the workspace name. */}

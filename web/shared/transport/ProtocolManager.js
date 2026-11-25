@@ -1,7 +1,7 @@
 import { WsProtocol } from "./WsProtocol";
 import { WebRtcProtocol } from "./WebRtcProtocol";
 import { registerProtocol, getProtocol } from "./registry";
-import { CHANNELS, ADAPTER_STATE, REJOIN_DEBOUNCE_MS, RTC_CONNECT_TIMEOUT_MS, RTC_DEFER_MAX_MS, STUN_PROBE } from "@/shared/constants/transport";
+import { CHANNELS, ADAPTER_STATE, REJOIN_DEBOUNCE_MS, RTC_CONNECT_TIMEOUT_MS, RTC_DEFER_MAX_MS, STUN_PROBE, WS_CONTROL_CARRY_MS } from "@/shared/constants/transport";
 import { probePublicIp, shouldRearmOnIpChange, NO_PUBLIC_IP } from "./stunProbe";
 import { debugLog } from "@/shared/utils/debugLog";
 import { termLog } from "@/shared/utils/termLog";
@@ -10,9 +10,9 @@ import { pickAdapter } from "./lib/controlRouting";
 import { nextRestartStep, restartTimerAction, restartRtcAction, peerDeadline } from "./lib/rtcRecoveryPolicy";
 import { attachWatchers, kickWsZombie } from "./lib/pmWatchers";
 import { handleWsStateChange, handleRtcStateChange } from "./lib/adapterStateHandlers";
-import { buildConfig, initialState } from "./lib/pmConfig";
+import { buildConfig, initialState, createIntakeFor } from "./lib/pmConfig";
 import { initSignalingClient, handleApprovalSignal, onSignalingReady, sendSignaling, flushSigBuffer, refreshTunnelUrl } from "./lib/pmSignaling";
-import { sendControl, flushBuffer, dispatch, onBinary, scheduleAckTimeout } from "./lib/pmMessaging";
+import { sendControl, flushBuffer, dispatch, onBinary, scheduleAckTimeout, sendStreamEvent, sendOn } from "./lib/pmMessaging";
 import { handleDeviceAuthEvent, maybeSendTailProof, DEVICE_AUTH_EVENTS } from "./lib/deviceTrust";
 
 registerProtocol(WsProtocol);
@@ -27,6 +27,8 @@ export class ProtocolManager {
     this._rtcCallbacks = rtcCallbacks;
     this._peerId = peerId;
     Object.assign(this, initialState());
+    // Inbound sequencer needs this PM's deliver(); build after state exists.
+    this._intakeSeq = createIntakeFor(this);
 
     // Outlives carriers so app listeners persist across carrier switches.
     this._bus = createClientBus(this);
@@ -62,6 +64,22 @@ export class ProtocolManager {
     return kickWsZombie(this, reason);
   }
 
+  // A control ack that never arrived proves the carrier's write path is dead
+  // even while its inbound heartbeats still flow. Put control on the alive WS
+  // (replaying the unconfirmed window is safe: the peer dedupes by sq) and
+  // rebuild RTC in the background; an RTC reopen clears the carry.
+  carryControlOnWs(reason = "?") {
+    const ws = this._adapters.get("ws");
+    if (!ws?.ready) return false;
+    const first = this._wsCarryUntil <= Date.now();
+    this._wsCarryUntil = Date.now() + WS_CONTROL_CARRY_MS;
+    if (!first) { this._flushBuffer(); return true; }
+    termLog("switch", `control → WS carry ${WS_CONTROL_CARRY_MS}ms (${reason})`);
+    this._flushBuffer();
+    this._forceRestartRtc(`ws-carry:${reason}`);
+    return true;
+  }
+
   emit(event, ...args) {
     this._sendControl(event, args);
   }
@@ -70,6 +88,11 @@ export class ProtocolManager {
     const adapter = this._pickAdapter(channel);
     if (!adapter) return false;
     return adapter.send(channel, payload);
+  }
+
+  // One envelope on a NAMED carrier — probes must test that lane, not the best one.
+  _sendOnAdapter(adapter, env) {
+    return sendOn(this, adapter, env);
   }
 
   connect() {
@@ -255,9 +278,17 @@ export class ProtocolManager {
     }
     this._adapters.clear();
     this._bus.clear();
-    this._buffer = [];
+    this._intakeSeq?.reset();
+    this._outLog?.clear();
+    this._peerSeqCtl = false;
     this._connected = false;
     this._rawSocket = null;
+    this._wsCarryUntil = 0;
+    for (const p of this._rttPending.values()) {
+      clearTimeout(p.timer);
+      p.resolve?.(null);
+    }
+    this._rttPending.clear();
     this._disarmRestart();
     termLog("switch", `RESET attempts (was ${this._rtcRestartAttempts}) reason=pm-disconnect`);
     this._rtcRestartAttempts = 0;
@@ -265,6 +296,16 @@ export class ProtocolManager {
     this._rtcGivenUp = false;
     this._giveUpIp = null;
     this._lastStunProbeAt = 0;
+    // The PM itself is going away — now (and only now) pending acks are a real
+    // failure: no carrier will ever deliver the reply.
+    for (const [ackId, cb] of this._pendingAcks) {
+      try { cb({ error: "disconnected" }); } catch {}
+      const t = this._ackTimers.get(ackId);
+      if (t) clearTimeout(t);
+    }
+    this._pendingAcks.clear();
+    this._ackReqs?.clear();
+    this._admitQueue = [];
     for (const t of this._ackTimers.values()) clearTimeout(t);
     this._ackTimers.clear();
   }
@@ -318,7 +359,11 @@ export class ProtocolManager {
         this._wsCallbacks.onDisconnect?.(`${adapterId}-${state}`);
       }
     }
-    this._flushBuffer();
+    // Full replay only on a lane actually (re)opening or dying — a transient
+    // "degraded" (ICE blip) must not re-send the unconfirmed window every time.
+    if (state === ADAPTER_STATE.open || state === ADAPTER_STATE.closed) this._flushBuffer();
+    // No carrier = freeze gap deadlines; they re-arm (and re-ask) on reconnect.
+    this._intakeSeq?.setPaused(!ready);
   }
 
   // Debounce rejoin on carrier reconnect to allow pending RTC connection to settle first.
@@ -366,7 +411,20 @@ export class ProtocolManager {
   }
 
   _pickAdapter(channel) {
+    if (channel === CHANNELS.control && this._wsCarryUntil > Date.now()) {
+      const ws = this._adapters.get("ws");
+      if (ws?.ready) return ws;
+    }
     return pickAdapter(this._adapters, this._profile, channel);
+  }
+
+  /** True once the host speaks the sequenced stream (caps.seqCtl). */
+  _seqActive() {
+    return this._peerSeqCtl === true;
+  }
+
+  _sendStreamEvent(event, arg, ackId = null) {
+    sendStreamEvent(this, event, arg, ackId);
   }
 
   _sendControl(event, args) {
@@ -385,8 +443,8 @@ export class ProtocolManager {
     onBinary(this, msg);
   }
 
-  _scheduleAckTimeout(ackId) {
-    scheduleAckTimeout(this, ackId);
+  _scheduleAckTimeout(ackId, ctx) {
+    scheduleAckTimeout(this, ackId, ctx);
   }
 
   // Two-phase RTC recovery: fast initial backoff followed by periodic background probe.

@@ -1,6 +1,6 @@
 "use client";
 
-import { createContext, useContext, useEffect, useState, useCallback } from "react";
+import { createContext, useContext, useEffect, useState, useCallback, useMemo } from "react";
 import { DEFAULT_THEME, STORAGE_KEY, THEME_KEYS } from "./themeConfig";
 
 const ThemeContext = createContext({ theme: DEFAULT_THEME, setTheme: () => {}, toggleTheme: () => {} });
@@ -15,7 +15,7 @@ const applyClass = (theme) => {
     const win = window.__TAURI__?.window?.getCurrentWindow?.();
     if (win) {
       win.setTheme?.(theme)?.catch?.(() => {});
-      win.setBackgroundColor?.(theme === "light" ? "#e7e7e9" : "#2a2a2a")?.catch?.(() => {});
+      win.setBackgroundColor?.(theme === "light" ? "#F2F1ED" : "#2a2a2a")?.catch?.(() => {});
     }
   } catch {}
 };
@@ -56,8 +56,11 @@ export function ThemeProvider({ children }) {
     setTheme(theme === "dark" ? "light" : "dark");
   }, [theme, setTheme]);
 
+  // Fresh object per render would re-render every consumer on any parent render.
+  const value = useMemo(() => ({ theme, setTheme, toggleTheme }), [theme, setTheme, toggleTheme]);
+
   return (
-    <ThemeContext.Provider value={{ theme, setTheme, toggleTheme }}>
+    <ThemeContext.Provider value={value}>
       {children}
     </ThemeContext.Provider>
   );

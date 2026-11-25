@@ -1,84 +1,229 @@
-import { CHANNELS, ADAPTER_STATE, RTC_HEARTBEAT_LEGACY_TIMEOUT_MS } from "@/shared/constants/transport";
+import { CHANNELS, ADAPTER_STATE, RTC_HEARTBEAT_LEGACY_TIMEOUT_MS, NOT_ADMITTED, SEQ_CTL } from "@/shared/constants/transport";
+import { STREAM_EVENTS } from "../seqStream";
 import { debugLog } from "@/shared/utils/debugLog";
 import { termLog } from "@/shared/utils/termLog";
 import { probeRtcLiveness } from "./pmWatchers";
 
 // Control message sending, ack tracking, buffering, and inbound dispatch.
+//
+// Every control envelope is logged in the PM's replay ring and stamped with
+// {sq, ep, rs}; the peer's sequencer dedupes, orders and repairs gaps. Send
+// paths therefore never "lose" a message to a carrier swap — they re-send and
+// let the receiver decide what is new.
 
 // Send control event with multi-arg and optional ack callback.
 export function sendControl(pm, event, args) {
   const last = args[args.length - 1];
   const cb = typeof last === "function" ? args.pop() : null;
-  const adapter = pm._pickAdapter(CHANNELS.control);
-  if (!adapter) {
-    debugLog("transport", `[pm] buffer event=${event} (no adapter ready)`);
-    termLog("switch", `buffer "${event}" (no adapter)`);
-    pm._buffer.push({ event, args, cb });
-    return;
+  const ackId = cb ? registerAck(pm, event, args, cb) : null;
+  const env = pm._outLog.append({ event, args, ackId });
+  // Remember the ring slot so its ack can retire it from the replay window.
+  if (ackId) {
+    const req = pm._ackReqs?.get(ackId);
+    if (req) req.sq = env.sq;
   }
-  debugLog("transport", `[pm] send control event=${event} via=${adapter.constructor.id}`);
-  if (adapter.constructor.id === "rtc") {
-    let ackId = null;
-    if (cb) {
-      ackId = `c_${++pm._ackSeq}`;
-      pm._pendingAcks.set(ackId, cb);
-      // Timeout detects zombie RTC and retries safe reads over WS or triggers restart.
-      pm._scheduleAckTimeout(ackId, { event, args });
-    }
-    // If RTC send fails, retry alternative adapter or buffer for next available carrier.
-    if (!adapter.send(CHANNELS.control, { event, args, ackId })) {
-      const retry = pm._pickAdapter(CHANNELS.control);
-      if (retry && retry !== adapter && retry.send(CHANNELS.control, cb ? { event, args, ackId, cb } : { event, args, ackId })) return;
-      debugLog("transport", `[pm] rtc refused event=${event} → buffered`);
-      pm._buffer.push({ event, args, cb });
-    }
-  } else {
-    adapter.send(CHANNELS.control, { event, args, cb });
+  debugLog("transport", `[pm] send control event=${event} sq=${env.sq}`);
+  ship(pm);
+}
+
+/** Acks are peer-scoped, not carrier-scoped: a lost carrier must not kill one. */
+function registerAck(pm, event, args, cb) {
+  const ackId = `c_${++pm._ackSeq}`;
+  pm._pendingAcks.set(ackId, cb);
+  pm._ackReqs?.set(ackId, { event, args, tries: 0 });
+  pm._scheduleAckTimeout(ackId, { event, args, ackId });
+  return ackId;
+}
+
+/** One door for every send: drain the ring's unsent tail on the best carrier.
+ *  A refusal stops the drain and the next carrier event resumes it. */
+export function ship(pm) {
+  const adapter = pm._pickAdapter(CHANNELS.control);
+  if (!adapter) return;
+  for (const queued of pm._outLog.unsentList()) {
+    if (!sendOn(pm, adapter, queued)) return;
+    pm._outLog.markSent(queued.sq);
   }
 }
 
+export function sendOn(pm, adapter, env) {
+  const wire = {
+    event: env.event,
+    args: env.args || [],
+    ackId: env.ackId ?? null,
+    sq: env.sq ?? null,
+    ep: pm._seqEpoch,
+    rs: pm._intakeSeq.applied
+  };
+  if (adapter.constructor.id === "ws") {
+    // socket.io cannot carry envelope fields — wrap it. The wrapper only ever
+    // goes to a host that announced seqCtl, so no old peer sees it.
+    if (!pm._peerSeqCtl) {
+      // Unsequenced WS still has socket.io's own ack — the callback is the ack.
+      const cb = env.ackId ? (...resp) => resolveAck(pm, env.ackId, resp) : null;
+      return adapter.send(CHANNELS.control, cb
+        ? { event: env.event, args: env.args, cb }
+        : { event: env.event, args: env.args });
+    }
+    return adapter.send(CHANNELS.control, { event: STREAM_EVENTS.ENV, args: [wire] });
+  }
+  return adapter.send(CHANNELS.control, wire);
+}
+
+function resolveAck(pm, ackId, resp) {
+  const cb = pm._pendingAcks.get(ackId);
+  if (!cb) return;
+  // Refused by a stale admission, not by the feature: hold it, repair the
+  // connection, re-send after device:approved. Bounded — past the cap the
+  // caller gets the refusal and shows its own "not sent".
+  const req = pm._ackReqs?.get(ackId);
+  if (resp?.[0]?.error === NOT_ADMITTED && req && req.tries < SEQ_CTL.admitRetryMax) {
+    req.tries++;
+    if (!pm._admitQueue.includes(ackId)) pm._admitQueue.push(ackId);
+    termLog("switch", `not-admitted ${req.event} → hold for re-admission (try ${req.tries})`);
+    recoverAdmission(pm, "ack");
+    return;
+  }
+  // The peer ran it: a later carrier event must not replay it as new work.
+  if (Number.isInteger(req?.sq)) pm._outLog.markAcked(req.sq);
+  pm._ackReqs?.delete(ackId);
+  pm._pendingAcks.delete(ackId);
+  const t = pm._ackTimers.get(ackId);
+  if (t) { clearTimeout(t); pm._ackTimers.delete(ackId); }
+  cb(...(resp || []));
+}
+
+export function sendStreamEvent(pm, event, arg, ackId = null) {
+  pm._outLog.append({ event, args: arg === undefined ? [] : [arg], ackId });
+  ship(pm);
+}
+
+/** A carrier event — replay the unconfirmed window (lane switch loses nothing),
+ *  then resume gap repair. The host's sequencer dedupes what it already had. */
 export function flushBuffer(pm) {
-  if (!pm._buffer.length) return;
   const adapter = pm._pickAdapter(CHANNELS.control);
   if (!adapter) return;
-  // Drain buffer in one pass to prevent infinite loops on send refusals.
-  const queued = pm._buffer.splice(0);
-  debugLog("transport", `[pm] flush ${queued.length} buffered via=${adapter.constructor.id}`);
-  for (const { event, args, cb } of queued) {
-    pm._sendControl(event, cb ? [...args, cb] : args);
+  pm._intakeSeq.setPaused(false);
+  const replay = pm._outLog.replayList();
+  for (const queued of replay) {
+    if (!sendOn(pm, adapter, queued)) return;
+    pm._outLog.markSent(queued.sq);
   }
+}
+
+/** Deliver one envelope to its handlers exactly once (sequencer output). */
+export function deliver(pm, env) {
+  switch (env.event) {
+    case STREAM_EVENTS.ACK:
+      return dispatchAck(pm, env);
+    case STREAM_EVENTS.GAP:
+      return serveGap(pm, env.args?.[0]);
+    case STREAM_EVENTS.GAP_MISS:
+      return pm._intakeSeq.gapMissed(env.args?.[0]?.from);
+    case STREAM_EVENTS.RTT_ACK:
+      return resolveRttProbe(pm, env.args?.[0]);
+    case STREAM_EVENTS.RTT:
+      return; // host-only: a client never answers a probe
+    default:
+      break;
+  }
+  // Ack replies may arrive on a different carrier than the request left on.
+  if (env.ackId && pm._pendingAcks.has(env.ackId)) return resolveAck(pm, env.ackId, env.args);
+  handleControlEvent(pm, env);
+}
+
+function dispatchAck(pm, env) {
+  resolveAck(pm, env.ackId, env.args);
+}
+
+/** Probe reply: the named carrier's write path is proven for this round trip. */
+function resolveRttProbe(pm, payload) {
+  const pending = pm._rttPending?.get(payload?.id);
+  if (!pending) return;
+  pm._rttPending.delete(payload.id);
+  clearTimeout(pending.timer);
+  pending.resolve(true);
+}
+
+function serveGap(pm, { from, to } = {}) {
+  const range = pm._outLog.range(from, to);
+  if (!range) { sendStreamEvent(pm, STREAM_EVENTS.GAP_MISS, { from }); return; }
+  const adapter = pm._pickAdapter(CHANNELS.control);
+  if (!adapter) return;
+  for (const env of range) if (!sendOn(pm, adapter, env)) break;
 }
 
 // Dispatch incoming message from RTC or WS carrier.
 export function dispatch(pm, event, payload, source) {
-  // Cache host capabilities on PM and forward to RTC adapter.
-  if (event === "srvCaps") {
-    const caps = source === "rtc" ? payload?.args?.[0] : payload;
-    debugLog("transport", `[pm] srvCaps from host via ${source}: ${JSON.stringify(caps)}`);
-    pm._srvCaps = caps || {};
-    pm._adapters.get("rtc")?.setPeerCaps?.(pm._srvCaps);
+  // WS carries the envelope wrapper (payload IS the wire — adapters hand us the
+  // event's first arg); RTC carries two shapes: a control envelope (args array)
+  // or bare lane data (tiles) that must arrive as the single first arg.
+  let env;
+  if (event === STREAM_EVENTS.ENV) env = payload;
+  else if (source === "rtc") {
+    env = Array.isArray(payload?.args)
+      ? { ...payload, event }
+      : { event, args: [payload], ackId: null, sq: null, ep: null };
   }
-  // Resolve ack reply — may arrive via RTC or WS (host falls back to WS when RTC dies)
-  if (event === "__ack") {
-    const { ackId, args } = payload || {};
-    const cb = pm._pendingAcks.get(ackId);
-    if (cb) {
-      pm._pendingAcks.delete(ackId);
-      const t = pm._ackTimers.get(ackId);
-      if (t) { clearTimeout(t); pm._ackTimers.delete(ackId); }
-      cb(...(args || []));
+  else env = { event, args: [payload], ackId: null };
+  if (!env?.event) return;
+  if (Number.isInteger(env.rs)) pm._outLog.setApplied(env.rs);
+  if (Number.isInteger(env.sq) && !pm._intakeSeq.armed && pm._peerSeqCtl) pm._intakeSeq.arm();
+  pm._intakeSeq.push(env);
+}
+
+/** The host's admission for this PM went stale (its connection closed under a live
+ *  carrier). Re-dial one carrier so the host admits a fresh connection; the held
+ *  requests ride again on the device:approved that follows. */
+export function recoverAdmission(pm, reason) {
+  const now = Date.now();
+  if (now - pm._admitKickAt < SEQ_CTL.admitKickMinMs) return;
+  pm._admitKickAt = now;
+  const ws = pm._adapters.get("ws");
+  termLog("switch", `admission stale (${reason}) → re-dial ${ws ? "ws" : "rtc"}`);
+  if (ws?.forceReconnect) { try { ws.forceReconnect(); } catch {} return; }
+  pm._forceRestartRtc?.("not-admitted");
+}
+
+function resendAdmitQueue(pm) {
+  const queue = pm._admitQueue.splice(0);
+  if (!queue.length) return;
+  termLog("switch", `re-admitted → re-send ${queue.length} held request(s)`);
+  for (const ackId of queue) {
+    const req = pm._ackReqs.get(ackId);
+    if (!req || !pm._pendingAcks.has(ackId)) continue;
+    const env = pm._outLog.append({ event: req.event, args: req.args, ackId });
+    // The re-append is a new ring slot; its ack retires this one, not the old.
+    req.sq = env.sq;
+  }
+  ship(pm);
+}
+
+/** Application-level events that must run before/sidestep the sequencer. */
+export function handleControlEvent(pm, env) {
+  const { event } = env;
+  const args = Array.isArray(env.args) ? env.args : [];
+  if (event === "srvCaps") {
+    const caps = args[0] ?? env;
+    debugLog("transport", `[pm] srvCaps from host: ${JSON.stringify(caps)}`);
+    pm._srvCaps = caps || {};
+    if (caps?.seqCtl && !pm._peerSeqCtl) {
+      pm._peerSeqCtl = true;
+      termLog("switch", "host announced seqCtl → sequenced control stream active");
     }
+    pm._adapters.get("rtc")?.setPeerCaps?.(pm._srvCaps);
     return;
   }
-  // Renegotiate fresh offer on device approval if previous RTC attempt died while waiting.
+  if (event === "conn:notAdmitted") {
+    recoverAdmission(pm, "notice");
+    return;
+  }
   if (event === "device:approved") {
     pm._awaitingApproval = false;
+    resendAdmitQueue(pm);
     const rtc = pm._adapters.get("rtc");
-    if (pm._canSignal() && (!rtc || rtc.state === ADAPTER_STATE.closed)) {
-      pm._restartRtc("device-approved");
-    }
+    if (pm._canSignal() && (!rtc || rtc.state === ADAPTER_STATE.closed)) pm._restartRtc("device-approved");
   }
-  // Host test-toggle re-enabled RTC → clear the stop-retry flag and renegotiate.
   if (event === "rtc:enabled") {
     if (pm._rtcTestDisabled) {
       pm._rtcTestDisabled = false;
@@ -88,36 +233,35 @@ export function dispatch(pm, event, payload, source) {
     return;
   }
   if (event === "tunnel:updated") {
-    const data = source === "rtc" ? payload?.args?.[0] : payload;
-    if (data) {
-      const { tunnelUrl, localIp, status } = data;
-      // Ignore tunnel update when current page origin is the host workspace.
-      if (typeof window !== "undefined" && pm._auth.tunnelUrl === window.location?.origin) {
-        termLog("switch", `tunnel:updated ignored (carrier is the page origin; got url=${tunnelUrl || "none"})`);
-        return;
-      }
-      termLog("switch", `tunnel:updated recv (status=${status} url=${tunnelUrl || "none"})`);
-      if (status === "ready" && tunnelUrl) {
-        const urlChanged = pm._auth.tunnelUrl !== tunnelUrl;
-        pm._auth.tunnelUrl = tunnelUrl;
-        if (localIp) pm._auth.localIp = localIp;
-        pm._wsCallbacks.onUrlUpdate?.({ tunnelUrl, localIp });
-        const ws = pm._adapters.get("ws");
-        if (ws && (!ws.ready || urlChanged)) {
-          termLog("switch", `tunnel:updated → ${urlChanged ? "url changed" : "ws not ready"} → retry ws with new URL`);
-          try { ws.retryNow("tunnel-updated"); } catch {}
-        }
-      } else if (status === "down") {
-        pm._auth.tunnelUrl = "";
-        pm._wsCallbacks.onUrlUpdate?.({ tunnelUrl: "", localIp });
-      }
-    }
+    handleTunnelUpdated(pm, args[0]);
     return;
   }
-  const args = source === "rtc" && Array.isArray(payload?.args)
-    ? payload.args
-    : [payload];
   pm._bus?.dispatch(event, args);
+}
+
+function handleTunnelUpdated(pm, data) {
+  if (!data) return;
+  const { tunnelUrl, localIp, status } = data;
+  // Ignore tunnel update when current page origin is the host workspace.
+  if (typeof window !== "undefined" && pm._auth.tunnelUrl === window.location?.origin) {
+    termLog("switch", `tunnel:updated ignored (carrier is the page origin; got url=${tunnelUrl || "none"})`);
+    return;
+  }
+  termLog("switch", `tunnel:updated recv (status=${status} url=${tunnelUrl || "none"})`);
+  if (status === "ready" && tunnelUrl) {
+    const urlChanged = pm._auth.tunnelUrl !== tunnelUrl;
+    pm._auth.tunnelUrl = tunnelUrl;
+    if (localIp) pm._auth.localIp = localIp;
+    pm._wsCallbacks.onUrlUpdate?.({ tunnelUrl, localIp });
+    const ws = pm._adapters.get("ws");
+    if (ws && (!ws.ready || urlChanged)) {
+      termLog("switch", `tunnel:updated → ${urlChanged ? "url changed" : "ws not ready"} → retry ws with new URL`);
+      try { ws.retryNow("tunnel-updated"); } catch {}
+    }
+  } else if (status === "down") {
+    pm._auth.tunnelUrl = "";
+    pm._wsCallbacks.onUrlUpdate?.({ tunnelUrl: "", localIp });
+  }
 }
 
 // Route incoming binary frames to their lane's bus event (file → file-bin,
@@ -131,6 +275,10 @@ export function onBinary(pm, msg) {
 // Idempotent read/create requests safe to retry over WS upon RTC ack timeout.
 const ACK_RETRY_SAFE = new Set(["getSessions", "getWorkspaces", "bg:get", "bg:list", "ai:create", "ai:peekSeq", "aiSince"]);
 
+// A prompt's ack waits for the host to boot the CLI, so a timeout is not proof the
+// carrier died — probe the ICE path instead of tearing down a healthy peer.
+const SLOW_ACK_EVENTS = new Set(["ai:prompt"]);
+
 export function scheduleAckTimeout(pm, ackId, ctx) {
   const timer = setTimeout(() => {
     pm._ackTimers.delete(ackId);
@@ -138,11 +286,59 @@ export function scheduleAckTimeout(pm, ackId, ctx) {
     const cb = pm._pendingAcks.get(ackId);
     const rtc = pm._adapters.get("rtc");
     const ws = pm._adapters.get("ws");
+    // Held for re-admission: the carrier is fine, the host just has not re-admitted yet.
+    if (pm._admitQueue?.includes(ackId)) return;
 
+    // Slow-by-design acks: retry over WS when the host dedupes by promptId (a repeat
+    // is a no-op there), otherwise measure ICE traffic before blaming the carrier.
+    if (SLOW_ACK_EVENTS.has(ctx?.event)) {
+      const dedupeSafe = pm._srvCaps?.promptDedupe && ctx.args?.[0]?.promptId;
+      if (cb && ws?.ready && dedupeSafe) {
+        // A fresh unsequenced copy, still carrying the ackId: the host answers a
+        // repeated promptId with ok instead of running it twice, and unlike the sq
+        // replay it still answers when the ring entry was already applied. The ack
+        // stays pending — the WS lane resolves it.
+        if (sendOn(pm, ws, { event: ctx.event, args: ctx.args, ackId })) {
+          termLog("switch", `ack-timeout ${ctx.event} → resend over ws (slow ack)`);
+          pm.carryControlOnWs?.(`ack-timeout:${ctx.event}`);
+          return;
+        }
+        // The adapter looks ready but its socket refuses writes — re-dial it so the
+        // pending ask replays on the next open.
+        try { ws.forceReconnect?.(); } catch {}
+      }
+      if (rtc?.ready || rtc?.state === ADAPTER_STATE.open) {
+        probeRtcLiveness(pm, `ack-timeout:${ctx.event}`);
+      }
+    }
+
+    // Sequenced peers: the stream only repairs a hole a later frame exposes, so a
+    // missing ack on a quiet session leaves the request unconfirmed forever when
+    // the RTC write path is dead under a live inbound (app resumed from background).
+    // Move control to the tunnel now; the replay carries the same sq, so the peer
+    // runs it at most once. ai:prompt is excluded — its ack is slow by design.
+    if (pm._seqActive() && cb && !SLOW_ACK_EVENTS.has(ctx?.event) && ws?.ready && rtc?.ready) {
+      pm.carryControlOnWs?.(`ack-timeout:${ctx?.event || "?"}`);
+      return;
+    }
+
+    // The sequencer only repairs a hole a later frame exposes, so a lost reply on a quiet
+    // session is never replayed — ask these idempotent reads again over WS.
     if (cb && ctx && ws?.ready && ACK_RETRY_SAFE.has(ctx.event)) {
       pm._pendingAcks.delete(ackId);
-      termLog("switch", `ack-timeout ${ctx.event} → retry via ws (rtc zombie?)`);
-      ws.send(CHANNELS.control, { event: ctx.event, args: ctx.args, cb });
+      if (ws.send(CHANNELS.control, { event: ctx.event, args: ctx.args, cb })) {
+        termLog("switch", `ack-timeout ${ctx.event} → retry via ws (rtc zombie?)`);
+        return;
+      }
+      // Not writable after all: keep the ask pending for the next carrier flush.
+      pm._pendingAcks.set(ackId, cb);
+    }
+
+    // Stream active: the request re-sends itself on whichever carrier is up and
+    // the host answers once, so a missing ack is not a zombie signal — leave it
+    // pending (the caller's own timeout covers a peer that truly died).
+    if (pm._seqActive() && cb) {
+      termLog("switch", `ack-timeout ${ctx?.event} → keep pending (sequenced stream owns retry)`);
       return;
     }
 

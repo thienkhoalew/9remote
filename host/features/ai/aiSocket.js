@@ -4,7 +4,7 @@ import { broadcast } from "../../transport/broadcast.js";
 import { createLogger } from "../../lib/logger.js";
 import { listSkills } from "./skills.js";
 import { listMcpServers } from "./mcp.js";
-import { searchRepoFiles } from "./files.js";
+import { listPathIndex, searchPathCandidates } from "./files.js";
 import { listModelOptionsFor, listOpencodeModelOptions, listOpencodeModelOptionsFromServer, listAllOpencodeModelOptions, resolveDefaultModel, resolveDefaultEffort } from "./models.js";
 import { runEngineDoctor, CARRIED_CLI_SUBTYPES } from "./aiSession.js";
 import { EVENT_TO_STATE, restatesOverGate } from "./aiStatus.js";
@@ -13,7 +13,7 @@ import { getConversation, getSessionAgent, setConversationId, getStatus, touchWo
 import { engineFromAgent } from "../terminal/conversationModes.js";
 import { SESSION_ID_RE } from "../terminal/agentCatalog.js";
 import { replayWindow, eventsSince } from "./aiEventSlice.js";
-import { AI_REPLAY_BYTES, AI_SINCE_MAX_BYTES, AI_ENGINES, AI_MODEL_CACHE_TTL_MS } from "./constants.js";
+import { AI_REPLAY_BYTES, AI_SINCE_MAX_BYTES, AI_ENGINES, AI_MODEL_CACHE_TTL_MS, AI_PROMPT_DEDUPE_MAX, AI_DOOR_REFRESH_COALESCE_MS } from "./constants.js";
 import { rewindSupport, unsupportedReason, resolveRewindTarget } from "./rewind.js";
 import { listRewindPoints, rewindable, previewRewind, applyRewind } from "./opencodeRewind.js";
 import * as claudeRewind from "./claudeRewind.js";
@@ -135,6 +135,19 @@ async function claudeApply(session, targets, target, { files = true } = {}) {
 let broadcastAttached = false;
 // Session ids whose create is in flight — a second mount waits on it rather than killing the first CLI.
 const creating = new Map();
+// sessionId → recent client prompt ids (insertion-ordered, capped).
+const seenPrompts = new Map();
+
+// True when this id was already accepted for the session; records it otherwise.
+function isRepeatPrompt(sessionId, promptId) {
+  if (typeof promptId !== "string" || !promptId) return false;
+  let ids = seenPrompts.get(sessionId);
+  if (!ids) { ids = new Set(); seenPrompts.set(sessionId, ids); }
+  if (ids.has(promptId)) return true;
+  ids.add(promptId);
+  if (ids.size > AI_PROMPT_DEDUPE_MAX) ids.delete(ids.values().next().value);
+  return false;
+}
 
 // Running sub-agents and background tasks, as raw harness records. A task spawns and
 // dies mid-turn, when no status transition fires, so the sidebar list hears it here —
@@ -168,7 +181,12 @@ function mirrorAiStatus(manager, sessionId, event, data, engine) {
 
 // Ack order: rebuild from the CLI transcript first, then metadata into the surviving log — reversed, F5 loses restored turns or the catalog.
 async function doorSession(session, engine = session.engine) {
-  session.refreshFromStore();
+  // Live events since the last rebuild are already in the log — only a stale one needs it.
+  const now = Date.now();
+  if (now - (session.lastDoorRefreshAt || 0) >= AI_DOOR_REFRESH_COALESCE_MS) {
+    session.lastDoorRefreshAt = now;
+    session.refreshFromStore();
+  }
   return { ...await emitConnectMetadata(session, engine), session: publicSession(session) };
 }
 
@@ -261,6 +279,14 @@ function mirrorAiConversation(sessionId, event, data, engine) {
   setConversationId(sessionId, getSessionAgent(sessionId) || engine, convId, "hook");
 }
 
+// A failure that names its prompt releases the id: the prompt never became a turn,
+// so a Resend must run it instead of being acked as a repeat forever.
+function releaseFailedPrompt(sessionId, event, data) {
+  if (!data?.promptId) return;
+  if (event !== "prompt_refused" && event !== "error") return;
+  seenPrompts.get(sessionId)?.delete(data.promptId);
+}
+
 // Only `thread/name/updated` signals a CLI-side rename; the transcript scan cannot see it.
 function mirrorThreadName(sessionId, event, data) {
   if (event !== "init" || !data?.threadName) return;
@@ -275,6 +301,7 @@ export function setupAiHandlers(socket, io, manager = globalAiManager) {
       // Streaming events fire per chunk and cli_event fires per CLI notification —
       // logging them drowns the file (cli_event alone was 94% of ai:debug lines).
       if (event !== "delta" && event !== "thinking" && event !== "cli_event") logger.debug(`[ai] event: ${event} session: ${sessionId}`);
+      releaseFailedPrompt(sessionId, event, data);
       // Failures also get a line here — the pane's error cannot be traced back otherwise.
       if (event === "exit" && (data?.error || (data?.code != null && data.code !== 0))) {
         logger.warn(`[ai] exit: session=${sessionId} engine=${manager.getSession(sessionId)?.engine || "claude"} code=${data.code ?? "-"} error=${data.error || "-"}`);
@@ -297,6 +324,7 @@ export function setupAiHandlers(socket, io, manager = globalAiManager) {
   // Fallback for tests or direct socket mocking
   if (!io || typeof io.emit !== "function") {
     const unsubscribe = manager.onEvent((sessionId, event, data, seq, epoch) => {
+      releaseFailedPrompt(sessionId, event, data);
       try {
         socket.emit(AI_SOCKET_EVENTS.EVENT, { sessionId, event, data, seq, epoch });
       } catch {}
@@ -378,8 +406,13 @@ export function setupAiHandlers(socket, io, manager = globalAiManager) {
     }
   });
 
-  socket.on(AI_SOCKET_EVENTS.PROMPT, async ({ sessionId, message, cwd, attachments }, cb) => {
+  socket.on(AI_SOCKET_EVENTS.PROMPT, async ({ sessionId, message, cwd, attachments, promptId }, cb) => {
     try {
+      // A Resend of a prompt whose ack was lost: the host already has it — answer, don't run it twice.
+      if (isRepeatPrompt(sessionId, promptId)) {
+        logger.info(`[ai] prompt: ${sessionId} repeat ${promptId} ignored`);
+        return cb?.({ ok: true, repeat: true });
+      }
       let session = manager.getSession(sessionId);
       if (!session) {
         logger.warn(`[ai] session ${sessionId} not found on prompt, auto-creating with claude`);
@@ -405,9 +438,13 @@ export function setupAiHandlers(socket, io, manager = globalAiManager) {
       logger.info(`[ai] prompt: ${sessionId} (engine: ${session.engine}): ${message?.slice(0, 60)}`);
       // The pane has already dropped its log; a refused /clear would strand an empty chat — stop the turn instead.
       if (String(message).trim() === "/clear" && session.isTurnRunning) session.stop();
-      const res = session.sendPrompt(message, attachments);
+      const res = session.sendPrompt(message, attachments, promptId);
+      // Refused before any turn existed: say so — an ok ack is what kept this loss silent.
+      if (res?.refused) return cb?.({ ok: false, error: res.error });
       cb?.({ ok: true, queued: Boolean(res?.queued) });
     } catch (err) {
+      // Not run — a Resend under the same id must be allowed through.
+      if (promptId) seenPrompts.get(sessionId)?.delete(promptId);
       logger.error(`[ai] prompt failed: ${err.message}`);
       cb?.({ ok: false, error: err.message });
     }
@@ -553,12 +590,17 @@ export function setupAiHandlers(socket, io, manager = globalAiManager) {
     }
   });
 
-  socket.on(AI_SOCKET_EVENTS.FILES, ({ workspace, query, limit = 25 }, cb) => {
+  // `@` mentions: the whole index once, or one host-side search when the client's
+  // trimmed copy could not see the file it needs (`query` present).
+  socket.on(AI_SOCKET_EVENTS.FILES, ({ workspace, query }, cb) => {
     try {
-      const files = searchRepoFiles(workspace, query, limit);
-      cb?.({ ok: true, files });
+      const ws = workspace || process.cwd();
+      if (typeof query === "string" && query.trim()) {
+        return cb?.({ ok: true, ...searchPathCandidates(ws, query) });
+      }
+      cb?.({ ok: true, ...listPathIndex(ws) });
     } catch (err) {
-      cb?.({ ok: false, error: err.message, files: [] });
+      cb?.({ ok: false, error: err.message, files: [], dirs: [] });
     }
   });
 
@@ -576,6 +618,7 @@ export function setupAiHandlers(socket, io, manager = globalAiManager) {
   socket.on(AI_SOCKET_EVENTS.DESTROY, async ({ sessionId }, cb) => {
     try {
       // A chat this run never loaded still owns a daemon proc + snapshot — clean both.
+      seenPrompts.delete(sessionId);
       if (sessionId && !manager.destroySession(sessionId)) await destroyDetachedChat(sessionId);
       // The sidebar's task rows key off records that die with the session — clear them.
       broadcastSessionTasks(io, sessionId, null);

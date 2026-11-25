@@ -46,7 +46,7 @@ export const TOGGLEABLE_BUTTONS = [
   { id: "remote", labelKey: "menu.remoteDesktop", descKey: "menu.remoteDesktopHint", group: "header", section: "remote" },
   { id: "sites", labelKey: "menu.sites", descKey: "menu.sitesHint", group: "header", section: "remote" },
   { id: "mobile", labelKey: "mobile.androidDevice", descKey: "mobile.androidDeviceHint", group: "header", section: "remote" },
-  { id: "notifications", labelKey: "menu.notificationsButton", descKey: "menu.notificationsButtonHint", group: "header", section: "plugins" },
+  { id: "notifications", labelKey: "menu.bellButton", descKey: "menu.bellButtonHint", group: "header", section: "plugins" },
   { id: "folder", labelKey: "menu.showFolder", group: "pane", section: "terminal", storeKey: "showFolderButton", setterKey: "setShowFolderButton" },
   { id: "note", labelKey: "menu.showNote", group: "pane", section: "terminal", storeKey: "showNoteButton", setterKey: "setShowNoteButton" }
 ];
@@ -63,7 +63,11 @@ export const MOBILE_FLOAT = {
 export const ARTIFACT_STACK_MAX = 20;
 export const WORKSPACE_GIT_POLL_MS = 10000;
 // Nested-repo scan depth; shallow by default to avoid drowning active repo.
-export const REPO_SCAN = { maxDepth: 1, deepMaxDepth: 3, cacheTtlMs: 30000 };
+// retry*: the panel mounts before the bus is up on a cold load, so a first scan that
+// answered "Not connected" is retried with backoff instead of sticking on empty.
+export const REPO_SCAN = { maxDepth: 1, deepMaxDepth: 3, cacheTtlMs: 30000, retryBaseMs: 1000, retryMaxMs: 16000 };
+// Which repo the Git tab opens by default, in order of preference.
+export const DEFAULT_REPO_BRANCHES = ["main", "master"];
 
 export const HISTORY_FETCH = {
   topThresholdLines: 5,
@@ -218,6 +222,10 @@ export const ORIENTATION_SETTLE_MS = 600;
 export const RECOVER_DEBOUNCE_MS = 150;
 export const PEEK_TIMEOUT_MS = 4000;
 export const GAP_FETCH_TIMEOUT_MS = 3000;
+// Quiet-tail probe: after a burst's output goes silent this long, one peekSeq checks
+// for a lost tail (no later chunk exists to trip the seq law).
+export const QUIET_PROBE_AFTER_MS = 5000;
+export const QUIET_PROBE_POLL_MS = 2000;
 export const JOIN_ACK_TIMEOUT_MS = 8000;
 export const AGENT_CLIS_TTL_MS = 60000;
 export const AGENT_HISTORY_TTL_MS = 30000;
@@ -248,7 +256,8 @@ export const TOUCH_SELECT = {
 
 export const PATH_SUGGEST = {
   verbs: ["cd", "ls", "ll", "cat", "less", "more", "head", "tail", "vim", "nvim", "nano", "bat", "code", "code-insiders", "rm", "cp", "mv", "mkdir", "touch", "chmod", "open", "grep"],
-  ttlMs: 5 * 60 * 1000,
+  // Short: a file created a minute ago must still show up in the next completion.
+  ttlMs: 10 * 1000,
   debounceMs: 120,
   maxDirs: 20,
   maxResults: 8

@@ -9,7 +9,7 @@ import { useFileBusStore } from "@/shared/stores/fileBusStore";
 import { useNotificationStore } from "@/shared/stores/notificationStore";
 import { useAllSessionStatus } from "@/shared/transport/hostConn";
 import { RemoteTargets, tailOf } from "@/features/terminal/components/TerminalEmptyState";
-import { Monitor, ArrowRight, KeyRound, QrCode, Settings } from "@/shared/components/ui/Icon";
+import { ArrowRight, KeyRound, QrCode, RefreshCw } from "@/shared/components/ui/Icon";
 import { vibrate } from "@/shared/utils/vibration";
 import { useI18n } from "@/shared/i18n";
 import { useFleetStore } from "@/shared/stores/fleetStore";
@@ -19,7 +19,7 @@ import { orderedHostsOf } from "@/features/hosts/lib/fleetTree";
 import { makeFleetActions } from "@/features/hosts/lib/fleetActions";
 import { sessionWorkspaceId } from "@/features/terminal/lib/paneLayout";
 import { isHostEnvironment } from "@/shared/utils/localOrigin";
-import { PANEL_HEADER_H_CLASS } from "@/shared/constants/layout";
+import { reloadWhenHostReady } from "@/shared/utils/hostReady";
 import SessionBackgroundModal from "@/features/terminal/components/SessionBackgroundModal";
 
 // Mobile-only: on desktop the sidebar already lists workspaces and terminals with more
@@ -61,26 +61,15 @@ export default function SessionList({
   const openMenu = useSlideMenuStore((s) => s.open);
   const setContext = useSlideMenuStore((s) => s.setContext);
   const setCallbacks = useSlideMenuStore((s) => s.setCallbacks);
-  const hiddenHeaderButtons = useTerminalStore((s) => s.hiddenHeaderButtons);
-  const showButton = (id) => !hiddenHeaderButtons.includes(id);
   const pushView = useTerminalStore((s) => s.pushView);
   // Pairing QR lives on the host's own page — hide the entry on the public web.
   const isHostUi = isHostEnvironment();
 
   const [bgTarget, setBgTarget] = useState(null);           // session whose background sheet is open
   const [terminalModal, setTerminalModal] = useState(null); // { workspaceId }
-  const [addHostOpen, setAddHostOpen] = useState(false);
-  const [pickerFor, setPickerFor] = useState(false);        // remote host picker sheet
+  const [addHostOpen, setAddHostOpen] = useState(false);    // header's add-host door
+  const [reloading, setReloading] = useState(false);        // reload button spins until unload
 
-  // Hosts that can answer the shared feature — the header button picks among
-  // them (one host = straight in, no sheet).
-  const online = (h) => h.status === "full" || h.status === "online";
-  const remoteHosts = fleetHosts.filter((h) => online(h) && h.remoteAvailable);
-  const pickHost = () => {
-    vibrate();
-    if (remoteHosts.length === 1) { onOpenRemoteHost?.(remoteHosts[0].key); return; }
-    setPickerFor(true);
-  };
   // Every host root in add order — the current host's tree renders at its own
   // spot among the siblings (tapping a foreign session opens a parallel tab).
   const orderedHosts = orderedHostsOf(fleetHosts, currentHost?.key);
@@ -147,10 +136,12 @@ export default function SessionList({
 
   return (
     <div className="h-full flex flex-col overflow-hidden relative">
-      {/* Translucent bar like the old design; safe-area padding for notched phones, where
-          env() is 0 everywhere else. */}
+      {/* No bar material: the header is a flex row ABOVE the scroll area, not over
+          it, so nothing ever scrolls beneath the title — a surface here was drawing a
+          bar that separated nothing. 9love's screens do the same. Safe-area padding
+          for notched phones, where env() is 0 everywhere else. */}
       <header
-        className={`relative z-10 bg-surface/80 backdrop-blur-md pl-[28px] pr-4 py-3 ${PANEL_HEADER_H_CLASS} flex items-center justify-between gap-2 flex-shrink-0 border-b border-border-subtle`}
+        className="relative z-10 pl-[28px] pr-4 py-3 flex items-center justify-between gap-2 flex-shrink-0"
         style={{ paddingTop: "calc(0.75rem + env(safe-area-inset-top, 0px))" }}
       >
         <div className="flex items-center gap-3 min-w-0">
@@ -162,22 +153,27 @@ export default function SessionList({
           />
         </div>
 
+        {/* The dock owns remote and settings; this header keeps identity plus the two
+            doors that only make sense from the list: pairing (host UI) and add-host. */}
         <div className="flex items-center gap-1 flex-shrink-0">
-          {showButton("remote") && remoteHosts.length > 0 && (
-            <HeaderButton icon={Monitor} label={t("menu.remoteDesktop")} onClick={pickHost} disabled={!connected} />
-          )}
+          <HeaderButton
+            icon={RefreshCw}
+            iconClass={reloading ? "animate-spin" : ""}
+            label={t("menu.reload")}
+            disabled={reloading}
+            onClick={async () => { setReloading(true); if (!(await reloadWhenHostReady())) setReloading(false); }}
+          />
+          <HeaderButton icon={KeyRound} label={t("hosts.addHost")} onClick={() => { vibrate(); setAddHostOpen(true); }} />
           {isHostUi && (
             <HeaderButton icon={QrCode} label={t("connection.pairTab")} onClick={() => { vibrate(); pushView({ type: "pair" }); }} />
           )}
-          <HeaderButton icon={KeyRound} label={t("hosts.addHost")} onClick={() => { vibrate(); setAddHostOpen(true); }} />
-          <HeaderButton icon={Settings} label={t("menu.title")} onClick={openMenu} />
         </div>
       </header>
 
       {/* Host row — the root of the workspace tree below, same component the desktop
           sidebar uses. It scrolls with the list: it is the tree's first node, not a bar. */}
       <div
-        className="relative z-10 flex-1 overflow-auto modal-scrollable pt-2 pb-12"
+        className="relative z-10 flex-1 overflow-auto modal-scrollable pt-2 pb-[calc(94px_+_var(--safe-bottom))]"
         style={{ overflowAnchor: "none" }}
       >
         {showWelcomeStage ? (
@@ -187,6 +183,7 @@ export default function SessionList({
               recent={recentWorkspaces}
               homeDir={homeDir}
               connected={connected}
+              isHostUi={isHostUi}
             />
           </div>
         ) : (
@@ -287,38 +284,11 @@ export default function SessionList({
       )}
 
       {addHostOpen && <AddHostModal onClose={() => setAddHostOpen(false)} />}
-
-      {pickerFor && (
-        <div
-          className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/60 backdrop-blur-[2px] animate-in fade-in duration-150"
-          onClick={() => setPickerFor(null)}
-        >
-          <div
-            className="card-elev w-full sm:max-w-sm max-h-[60%] overflow-auto modal-scrollable rounded-t-2xl sm:rounded-2xl p-2 animate-in slide-in-from-bottom-4 duration-150"
-            onClick={(e) => e.stopPropagation()}
-          >
-            {remoteHosts.map((h) => (
-              <button
-                key={h.key}
-                onClick={() => {
-                  const key = h.key;
-                  setPickerFor(false);
-                  onOpenRemoteHost?.(key);
-                }}
-                className="w-full flex items-center gap-2.5 px-3 py-3 text-left rounded-brand hover:bg-surface-2 active:bg-surface-2 transition-colors"
-              >
-                <Monitor size={16} className="text-text-muted shrink-0" />
-                <span className="flex-1 min-w-0 truncate text-sm text-text">{h.label || t("agentSwitcher.unnamed")}</span>
-              </button>
-            ))}
-          </div>
-        </div>
-      )}
     </div>
   );
 }
 
-function HeaderButton({ icon: Icon, label, onClick, disabled, className = "" }) {
+function HeaderButton({ icon: Icon, iconClass = "", label, onClick, disabled, className = "" }) {
   return (
     <button
       onClick={() => { vibrate(); onClick(); }}
@@ -328,22 +298,21 @@ function HeaderButton({ icon: Icon, label, onClick, disabled, className = "" }) 
         disabled ? "text-text-subtle cursor-not-allowed" : `text-text-muted hover:text-text hover:bg-surface-2 ${className}`
       }`}
     >
-      <Icon className="w-5 h-5" />
+      <Icon className={`w-5 h-5 ${iconClass}`} />
     </button>
   );
 }
 
 // First run: the two things this app can do as naked poster halves on a cinematic
-// stage (same white light as login), split by a hairline + brand dot.
-function WelcomeCards({ onAddWorkspace, recent, homeDir, connected }) {
+// stage (same white light as login), split by a hairline + brand dot. A remote client
+// only gets the workspace half — pairing a second machine is not its first job.
+function WelcomeCards({ onAddWorkspace, recent, homeDir, connected, isHostUi }) {
   const { t } = useI18n();
   const pushView = useTerminalStore((s) => s.pushView);
   // Right half connects another machine into the fleet — meaningful everywhere.
   const [addHostOpen, setAddHostOpen] = useState(false);
   return (
-    <div className="empty-stage w-full h-full">
-      <div className="empty-grid" />
-
+    <div className="empty-stage w-full h-full fade-in">
       <button
         onClick={() => { vibrate(); onAddWorkspace?.(); }}
         disabled={!connected}
@@ -355,9 +324,9 @@ function WelcomeCards({ onAddWorkspace, recent, homeDir, connected }) {
           className="empty-meta"
           dangerouslySetInnerHTML={{ __html: t("workspaces.emptyMetaVibe") }}
         />
-        <span className="empty-go">
+        <span className="empty-go empty-go-strong">
           {t("workspaces.emptyGoVibe")}
-          <ArrowRight size={14} className="text-brand-500" strokeWidth={2.2} />
+          <ArrowRight size={14} className="text-white" strokeWidth={2.2} />
         </span>
         {!!recent.length && (
           <span className="flex flex-wrap gap-1.5 mt-4 max-w-full">
@@ -376,22 +345,24 @@ function WelcomeCards({ onAddWorkspace, recent, homeDir, connected }) {
         )}
       </button>
 
-      <>
-        <div className="empty-hairline" aria-hidden />
+      {isHostUi && (
+        <>
+          <div className="empty-hairline" aria-hidden />
 
-        <button
-          onClick={() => { vibrate(); setAddHostOpen(true); }}
-            className="empty-half text-left active:opacity-80 enabled:active:scale-[0.99] transition-all duration-150 disabled:opacity-40 disabled:saturate-50"
-          >
-            <span className="empty-idx"><b>02</b> / {t("workspaces.emptyTagPair")}</span>
-            <span className="empty-word login-hero-grad">{t("workspaces.emptyWordPair")}</span>
-            <span className="empty-meta"><RemoteTargets /></span>
-            <span className="empty-go">
-              {t("workspaces.emptyGoPair")}
-              <ArrowRight size={14} className="text-brand-500" strokeWidth={2.2} />
-            </span>
-          </button>
-      </>
+          <button
+            onClick={() => { vibrate(); setAddHostOpen(true); }}
+              className="empty-half text-left active:opacity-80 enabled:active:scale-[0.99] transition-all duration-150 disabled:opacity-40 disabled:saturate-50"
+            >
+              <span className="empty-idx"><b>02</b> / {t("workspaces.emptyTagPair")}</span>
+              <span className="empty-word login-hero-grad">{t("workspaces.emptyWordPair")}</span>
+              <span className="empty-meta"><RemoteTargets /></span>
+              <span className="empty-go">
+                {t("workspaces.emptyGoPair")}
+                <ArrowRight size={14} className="text-brand-500" strokeWidth={2.2} />
+              </span>
+            </button>
+        </>
+      )}
 
       {addHostOpen && <AddHostModal onClose={() => setAddHostOpen(false)} />}
     </div>

@@ -5,6 +5,7 @@ import Spinner from "@/shared/components/ui/Spinner";
 import { RefreshCw } from "@/shared/components/ui/Icon";
 import { vibrate } from "@/shared/utils/vibration";
 import { useI18n } from "@/shared/i18n";
+import { hostReady } from "@/shared/utils/hostReady";
 
 const RELOAD_TIMEOUT_MS = 6000;
 
@@ -23,18 +24,20 @@ export default function ReconnectScreen({ label, inline = false }) {
     return () => clearTimeout(timer);
   }, []);
 
-  const handleReload = () => {
+  const handleReload = async () => {
     vibrate();
     setReloading(true);
+    // A reload during a host restart would land on a dead origin; wait for the host itself.
+    if (!(await hostReady())) { setReloading(false); return; }
     // Break the auto-login loop: land on the login page, where the saved key shows the host's real state.
     try { sessionStorage.setItem("9remote_manual_disconnect", "1"); } catch {}
-    setTimeout(() => window.location.reload(), 150);
+    window.location.reload();
   };
 
   return (
-    <div className={`${inline ? "absolute inset-0 z-10" : "fixed inset-0 z-40"} flex items-center justify-center animate-in fade-in duration-300`}>
+    <div className={`${inline ? "absolute inset-0 z-10" : "fixed inset-0 z-40"} flex items-center justify-center fade-in`}>
       <div className="cine-bg" aria-hidden>
-        <div className="cine-grid" />
+        <div className="cine-icons" />
       </div>
       <div className="relative z-10 flex flex-col items-center gap-3 px-6 text-center">
         <div className="flex items-center gap-2">
@@ -47,7 +50,7 @@ export default function ReconnectScreen({ label, inline = false }) {
           <button
             onClick={handleReload}
             disabled={reloading}
-            className="mt-2 px-4 py-2 bg-surface-2 hover:bg-surface-3 active:scale-[0.96] disabled:opacity-70 border border-border-subtle rounded-brand text-xs font-medium text-text transition-all duration-150 flex items-center gap-2 animate-in fade-in duration-300"
+            className="mt-2 px-4 py-2 bg-surface-2 hover:bg-surface-3 active:scale-[0.96] disabled:opacity-70 border border-border-subtle rounded-brand text-xs font-medium text-text transition-all duration-150 flex items-center gap-2 fade-in"
           >
             <RefreshCw size={14} className={`text-brand-500 ${reloading ? "animate-spin" : ""}`} />
             <span>{t("menu.reloadWeb") || "Reload"}</span>

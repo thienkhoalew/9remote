@@ -10,6 +10,7 @@ import { WORKER_API } from "@/shared/constants/API";
 import { TAIL_REJECT_REASON, LOGIN_ERROR_KEY, APPROVAL_STATUS } from "@/shared/constants/transport";
 import { sameList } from "@/shared/utils/shallowEqual";
 import { isNewer } from "@/shared/utils/versionCompare";
+import { clearAiCache } from "@/features/ai/lib/aiCacheStore";
 import { termLog } from "@/shared/utils/termLog";
 import { debugLog } from "@/shared/utils/debugLog";
 
@@ -134,7 +135,7 @@ export function useAgentBus() {
   }, [emitSessions, emitWorkspaces]);
 
   // Client capability announcement required by agent for binary/fragmented transport.
-  const CAPS = { fragOut: true, binOut: true, hb: 1, env2: 1, fragCtl: 1 };
+  const CAPS = { fragOut: true, binOut: true, hb: 1, env2: 1, fragCtl: 1, seqCtl: 1 };
   const announceCaps = (bus) => {
     termLog("switch", `caps → ${JSON.stringify(CAPS)} announced`);
     bus.emit("caps", CAPS);
@@ -189,6 +190,8 @@ export function useAgentBus() {
     bus.on("device:rejected", () => {
       termLog("diag", "EVENT device:rejected arrived → applying");
       applyApproval(APPROVAL_STATUS.rejected);
+      // A rejected device may no longer keep the chats it cached.
+      clearAiCache();
       // Stop auto-reconnect — user must re-submit key to try again
       disconnectRef.current?.();
     });
@@ -219,6 +222,7 @@ export function useAgentBus() {
         updateAvailable: !acted && isNewer(info.updateAvailable?.version, info.version) ? info.updateAvailable : null,
         canSelfUpdate: !!info.canSelfUpdate,
         remoteAvailable: !!info.remoteAvailable,
+        remoteStatus: info.remoteStatus || null,
         mobileAvailable: !!info.mobileAvailable
       });
       setRemoteAvailable(info.remoteAvailable);
@@ -277,7 +281,7 @@ export function useAgentBus() {
 
   const { bus, busRef, protocolRef, connected, connectionMode, carrier, retryStatus, disconnect, reconnect } = useBus({
     namespace: "",
-    redirectOnNoAuth: "/",
+    redirectOnNoAuth: "/login",
     onConnect: handleBusReady,
     // Wire dropped: the row follows the wire — "connecting" while the transport
     // retries (handleBusReady lands it back on "full"). Only from "full": a

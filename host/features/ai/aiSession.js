@@ -21,6 +21,14 @@ import { createLogger } from "../../lib/logger.js";
 
 const logger = createLogger("ai");
 
+// Order-insensitive JSON for the adopt guard below — a transcript rebuild can re-key
+// objects whose content is identical, and a false "changed" reset every reader for nothing.
+const stableJson = (v) => {
+  if (v === null || typeof v !== "object") return JSON.stringify(v) ?? "null";
+  if (Array.isArray(v)) return `[${v.map(stableJson).join(",")}]`;
+  return `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${stableJson(v[k])}`).join(",")}}`;
+};
+
 // eslint-disable-next-line no-control-regex
 const ANSI_RE = /\[[0-9;]*m/g;
 const stripAnsi = (text) => String(text || "").replace(ANSI_RE, "");
@@ -152,6 +160,14 @@ function capDeep(value) {
 // Drop `rendered` and `attachment.snippet`: the pane never reads them and together they were 30% of a real log.
 function slimAttachment(record) {
   if (!record?.attachment) return record;
+  // A hook's command/stdout feeds the model, not the reader: live it is ~3.7KB where a
+  // transcript rebuild keeps ~160B, and a tool-heavy turn crowded its own answer out of
+  // the replay window. SessionStart's content is the one hook a pane draws.
+  const att = record.attachment;
+  if (att.type === "hook_success" && att.hookEvent !== "SessionStart") {
+    const { command, stdout, stderr, content, ...rest } = att;
+    record = { ...record, attachment: rest };
+  }
   if (record.rendered === undefined && record.attachment.snippet === undefined) return record;
   const { rendered, attachment, ...rest } = record;
   if (attachment.snippet === undefined) return { ...rest, attachment };
@@ -210,6 +226,39 @@ function mergeCarried(carried, events) {
   return carried.length ? insertByIndex(events, carried) : events;
 }
 
+// A prompt the CLI accepted but has not written to its transcript yet (it sits in the CLI's own mid-turn
+// queue): a rebuild from that file must not drop the bubble the user already saw. Only the span after the
+// last turn-end is at risk — everything earlier was on disk before that turn could end.
+function unreleasedPrompts(oldLog, rebuilt) {
+  // Only the rebuilt tail holds the in-flight turn, so a prompt from an OLDER turn with the same
+  // words cannot stand in for the new one (the user re-asking a question must not vanish).
+  const flushed = new Set();
+  for (let i = rebuilt.length - 1; i >= 0; i--) {
+    const ev = rebuilt[i];
+    if (TURN_END_EVENTS.has(ev.event)) break;
+    if (ev.event === "user_message") flushed.add(ev.data?.text);
+  }
+  const carry = [];
+  for (let i = oldLog.length - 1; i >= 0; i--) {
+    const ev = oldLog[i];
+    if (TURN_END_EVENTS.has(ev.event)) break;
+    if (ev.event === "user_message" && !flushed.has(ev.data?.text)) carry.unshift(ev);
+  }
+  return carry;
+}
+
+// One merged stream record must stay inside a replay frame — the window steps over a
+// record wider than the budget, which would hide the whole reply on a reload. Same cap
+// capEvent puts on any single payload.
+const mergedStreamText = (prev, next) => {
+  const a = prev || "";
+  if (a.length >= AI_MAX_TOOL_OUTPUT) return a;
+  const merged = a + (next || "");
+  return merged.length > AI_MAX_TOOL_OUTPUT
+    ? `${merged.slice(0, AI_MAX_TOOL_OUTPUT)}\n… [truncated]`
+    : merged;
+};
+
 // Fold consecutive delta/thinking slices into one record; the log is a cache that only loses content.
 function compactEvents(events) {
   if (!Array.isArray(events) || events.length <= 1) return events;
@@ -217,7 +266,7 @@ function compactEvents(events) {
   for (const ev of events) {
     const last = compacted[compacted.length - 1];
     if (last && last.event === ev.event && (ev.event === "delta" || ev.event === "thinking")) {
-      last.data = { text: (last.data?.text || "") + (ev.data?.text || "") };
+      last.data = { text: mergedStreamText(last.data?.text, ev.data?.text) };
       if (ev.seq) {
         // The run's first seq — a client whose watermark sits inside the run already
         // holds part of this text and must not be handed the merged record.
@@ -605,13 +654,35 @@ export class AiSession {
     };
   }
 
-  // Rebuild and reset every client before the hydrate is answered, so the ack's window covers everything.
+  // Reconcile memory with the transcript for a door read — quietly. A read must never
+  // re-key the log or broadcast: the hydrating client gets this state in its own ack, and
+  // every other client heals through its own probe → aiSince lane. Appending the events
+  // the live stream missed (fresh seqs, same epoch) is the whole job; only a true
+  // replacement (reloadFromStore: rewind/rebind) resets and broadcasts.
   refreshFromStore() {
     if (!this.cliSessionId) return false;
     const { events: log } = this._rebuildFromStore(this.cliSessionId);
     if (!log) return false;
-    this._adoptLog(log);
-    return true;
+    // The transcript lags or compacted below memory — a read keeps the newer live log.
+    if (log.length <= this.history.length) return false;
+    const sig = (ev) => stableJson(ev?.data);
+    if (!this.history.length) {
+      for (const ev of log) this.history.push({ ...ev, seq: ++this.seqCounter, timestamp: ev.timestamp || Date.now() });
+      this.flushSaveSnapshot();
+      return true;
+    }
+    // Anchor: memory's last event must exist in the rebuilt log; past it, the tail is what live missed.
+    const anchor = this.history[this.history.length - 1];
+    const anchorSig = sig(anchor);
+    let p = -1;
+    for (let i = log.length - 1; i >= 0; i--) {
+      if (log[i].event === anchor.event && (log[i].data === anchor.data || sig(log[i]) === anchorSig)) { p = i; break; }
+    }
+    if (p < 0) return false; // structural drift — a reload flow owns replacing the log
+    const extra = log.slice(p + 1);
+    for (const ev of extra) this.history.push({ ...ev, seq: ++this.seqCounter, timestamp: ev.timestamp || Date.now() });
+    if (extra.length) this.flushSaveSnapshot();
+    return extra.length > 0; // _fillGap reads this as "the missed events are on the log"
   }
 
   // A rewind shortened the CLI's own store; rebuild + reset or clients keep rendering the discarded turns.
@@ -624,11 +695,25 @@ export class AiSession {
     return true;
   }
 
-  _adoptLog(events) {
+  _adoptLog(events, { carryUnreleased = false } = {}) {
     // Replace with what the transcript reconstructs, but carry the harness-only records across at their old positions — never re-emit them.
-    const merged = mergeCarried(cliEventsOf(this.history), events);
+    let merged = mergeCarried(cliEventsOf(this.history), events);
+    // The CLI flushes a queued mid-turn prompt only when it releases it — an F5 in that
+    // window must not erase the message. Rewind/resume pass no flag: their cut is deliberate.
+    if (carryUnreleased) {
+      const carry = unreleasedPrompts(this.history, merged);
+      if (carry.length) merged = [...merged, ...carry];
+    }
     // From 1, and the counter restarts — else the next live event carries the dead log's seq and is dropped.
     const log = renumber(capLog(merged));
+    // A door read that reconstructs the very log we already hold must not re-key it: the epoch
+    // bump + reset broadcast invalidated every reader's watermark, each reader re-hydrated,
+    // and the door's 2s coalesce re-armed — a phase-locked cross-device refetch loop.
+    if (this.history.length === log.length && log.every((ev, i) => {
+      const cur = this.history[i];
+      return !!cur && cur.event === ev.event
+        && (cur.data === ev.data || stableJson(cur.data) === stableJson(ev.data));
+    })) return this.history;
     this.seqCounter = log.length;
     this.logEpoch++;
     this.history = log;
@@ -737,6 +822,16 @@ export class AiSession {
     // A record the harness itself does not keep is not history — see LIVE_ONLY_CLI_SUBTYPES.
     if (record && event === "cli_event" && LIVE_ONLY_CLI_SUBTYPES.has(data?.subtype)) record = false;
     if (record && event === "cli_event" && LIVE_ONLY_CLI_TYPES.has(data?.type)) record = false;
+    // An attachment the pane draws no row for is state for the model, not history: a turn
+    // closes with a burst of hooks (measured 36 × ~560B) that filled the replay window and
+    // pushed its own answer out. Only two kinds ever reach the screen — a SessionStart
+    // hook and a queued prompt (see harnessTasks.noticeFrom). Live clients still get them.
+    if (record && event === "cli_event" && data?.type === "attachment") {
+      const att = data.record?.attachment || data.record;
+      const drawn = (att?.type === "hook_success" && att.hookEvent === "SessionStart")
+        || att?.type === "queued_command";
+      if (!drawn) record = false;
+    }
     if (event === "init") {
       if (data?.threadId) this.threadId = data.threadId;
       // A DIFFERENT conversation drops the byte offset — it indexes one transcript file; the same id keeps it.
@@ -794,8 +889,21 @@ export class AiSession {
     const seq = record ? ++this.seqCounter : undefined;
     // record=false broadcasts without logging — per-connect metadata must not accumulate on every F5.
     if (record) {
-      this.history.push({ seq, event: wire.event, data, timestamp: Date.now() });
-      if (this.history.length > AI_MAX_EVENTS) this.history.shift();
+      const last = this.history[this.history.length - 1];
+      const foldable = last && last.event === wire.event
+        && (wire.event === "delta" || wire.event === "thinking")
+        && typeof data?.text === "string" && typeof last.data?.text === "string";
+      // Fold a streamed run as it lands, not only at turn end: one record per token pushed
+      // the cap past a couple of turns, and a hydrate then replayed a tail with no prompt.
+      if (foldable) {
+        if (last.seq != null && last._fromSeq == null) last._fromSeq = last.seq;
+        last.data = { text: mergedStreamText(last.data.text, data.text) };
+        last.seq = seq;
+        last.timestamp = Date.now();
+      } else {
+        this.history.push({ seq, event: wire.event, data, timestamp: Date.now() });
+        if (this.history.length > AI_MAX_EVENTS) this.history.shift();
+      }
     }
     // Unrecorded events carry no seq — the client's watermark only knows recorded ones.
     // Chats have no PTY, so without this stamp the idle watchdog sees every turn as stalled from birth.
@@ -1098,7 +1206,7 @@ export class AiSession {
     this.flushSaveSnapshot();
   }
 
-  sendPrompt(prompt, attachments = null) {
+  sendPrompt(prompt, attachments = null, promptId = null) {
     // /clear is a host-side reset, not a message.
     if (String(prompt).trim() === "/clear") {
       // Refused mid-turn — rebuilding the adapter would kill the turn on screen.
@@ -1116,7 +1224,8 @@ export class AiSession {
       const item = {
         id: `q-${Date.now()}-${++queueIdSeq}`,
         text: prompt,
-        attachments
+        attachments,
+        promptId
       };
       this.promptQueue.push(item);
       this.emitQueueUpdate();
@@ -1134,11 +1243,14 @@ export class AiSession {
     }
     // The adapter's busy-check first — a refused prompt must not log a turn nothing will answer.
     try {
-      this.adapter?.sendPrompt(prompt, attachments);
+      this.adapter?.sendPrompt(prompt, attachments, promptId);
     } catch (err) {
-      this.emitNormalized("prompt_refused", { text: prompt, reason: String(err?.message || err) });
+      const reason = String(err?.message || err);
+      // promptId lets the socket layer release the dedupe id: a resend must be able
+      // to run a prompt that never became a turn.
+      this.emitNormalized("prompt_refused", { text: prompt, promptId, reason });
       if (this.promptQueue?.length) this._drainQueue();
-      return;
+      return { refused: true, error: reason };
     }
     this.isTurnRunning = true;
     this.turnStartedAt = Date.now();

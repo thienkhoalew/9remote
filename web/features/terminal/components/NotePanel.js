@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState, useCallback } from "react";
+import { createPortal } from "react-dom";
 import { Copy, X, Check, Trash2, Plus, GripVertical, Pin, PinOff } from "@/shared/components/ui/Icon";
 import { useI18n } from "@/shared/i18n";
 import { vibrate } from "@/shared/utils/vibration";
@@ -366,17 +367,19 @@ export default function NotePanel({ bus, sessionId, appendOnOpen, onClose, varia
     );
   }
 
-  return (
+  if (typeof document === "undefined") return null;
+
+  return createPortal(
     <div
-      className="fixed inset-0 bg-black/60 backdrop-blur-[2px] flex items-center justify-center z-[60] p-4"
+      className="modal-overlay z-[60] scrim"
       onMouseDown={(e) => { e.preventDefault(); onClose(); }}
     >
       <div
-        className="card-elev w-full max-w-lg h-[55dvh] min-h-[300px] flex flex-col overflow-hidden"
+        className="card-elev w-full max-w-lg h-[55%] min-h-0 flex flex-col overflow-hidden"
         onMouseDown={(e) => { e.stopPropagation(); }}
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="flex items-center justify-between pl-4 pr-2 py-2 border-b border-border bg-surface flex-shrink-0">
+        <div className="flex items-center justify-between pl-4 pr-2 py-2 border-b border-border flex-shrink-0">
           <div className="flex items-baseline gap-2 min-w-0">
             <span className="text-text text-sm font-medium truncate">{t("note.title")}</span>
             {hasItems && (
@@ -559,6 +562,7 @@ export default function NotePanel({ bus, sessionId, appendOnOpen, onClose, varia
         </form>
         )}
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }

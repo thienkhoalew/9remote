@@ -39,6 +39,9 @@ export default {
     copied: "Copied",
     promptNotSent: "Prompt didn't reach the host",
     resend: "Resend",
+    sending: "Sending…",
+    promptRecovered: "Not confirmed before reload",
+    inputNotSent: "Not sent — tap Send to retry",
     dismiss: "Dismiss",
     download: "Download",
     upload: "Upload",
@@ -256,6 +259,8 @@ export default {
     headerButtons: "Header buttons",
     settingsButtons: "Buttons",
     notificationsButton: "Notifications",
+    bellButton: "Bell Button",
+    bellButtonHint: "Show the bell in the terminal header",
     notificationsButtonHint: "Alerts when a terminal finishes or needs you.",
     remoteDesktopHint: "Control this machine's screen from your phone.",
     sitesHint: "Browse the host's Chrome and local sites.",
@@ -442,6 +447,11 @@ export default {
     browseFolders: "Browse folders…",
     shell: "Shell"
   },
+  ai: {
+    newChatTitle: "Start a new chat?",
+    newChatMessage: "The current chat will be closed and replaced by a new one.",
+    newChatConfirm: "New chat"
+  },
   files: {
     selectWorkspace: "Select Workspace",
     recentWorkspaces: "Recent Workspaces",
@@ -595,7 +605,8 @@ export default {
     discardConfirmTitle: "Discard Changes",
     discardConfirmDelete: "Are you sure you want to delete \"{name}\"? This cannot be undone.",
     discardConfirmDiscard: "Are you sure you want to discard changes in \"{name}\"? This cannot be undone.",
-    addToGitignore: "Add to .gitignore"
+    addToGitignore: "Add to .gitignore",
+    showMore: "Show {count} more"
   },
   fileExplorer: {
     explorer: "Explorer",
@@ -818,6 +829,15 @@ export default {
     sendKey: "Send Key",
     helpTitle: "Remote Desktop Help",
     notAvailable: "Remote desktop is not available",
+    unavailableTitle: "Remote Desktop isn't ready",
+    unavailableUnknown: "On {host}, open the 9Remote host window (Pair Device page) → Services → turn on Remote Desktop.",
+    unavailableNoCapture: "This machine has no screen to capture (headless, SSH or Codespaces), so Remote Desktop can't run on it.",
+    unavailableDisabled: "On {host}, open the 9Remote host window (Pair Device page) → Services → turn on Remote Desktop.",
+    unavailableScreenRecording: "Screen Recording is missing. On {host}: 9Remote → Services → Grant next to Screen Recording (or System Settings → Privacy & Security → Screen Recording → enable 9Remote), then turn on Remote Desktop.",
+    unavailableAccessibility: "Accessibility is missing. On {host}: 9Remote → Services → Grant next to Accessibility (or System Settings → Privacy & Security → Accessibility → enable 9Remote), then turn on Remote Desktop.",
+    unavailableMacRestart: "On macOS, if capture still fails after granting, quit and reopen 9Remote on the host.",
+    unavailableFailed: "The host refused to start screen capture. Check the 9Remote host window on {host} for details.",
+    unavailableOtherHosts: "Ready now",
     customizeKeys: "Customize keys",
     back: "Back",
     resetZoom: "Reset zoom",
@@ -1181,6 +1201,7 @@ export default {
     sessionIndex: "Go to terminal 1-9",
     closeTerminal: "Close terminal",
     fitPanes: "Auto-fit panes",
+    reloadApp: "Reload App",
     toggleFocus: "Toggle terminal / input focus",
     newTerminal: "New terminal",
     toggleSidebar: "Toggle sidebar",

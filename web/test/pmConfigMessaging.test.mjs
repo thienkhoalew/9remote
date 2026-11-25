@@ -5,7 +5,9 @@
 import assert from "node:assert/strict";
 import { TRANSPORT_PROFILES, CHANNELS, CONTROL_RTC_MAX_BYTES, ADAPTER_STATE } from "../shared/constants/transport.js";
 import { buildConfig, initialState } from "../shared/transport/lib/pmConfig.js";
-import { sendControl, flushBuffer, dispatch, onBinary, scheduleAckTimeout } from "../shared/transport/lib/pmMessaging.js";
+import { sendControl, flushBuffer, dispatch, onBinary, scheduleAckTimeout, sendStreamEvent } from "../shared/transport/lib/pmMessaging.js";
+import { createIntakeFor } from "../shared/transport/lib/pmConfig.js";
+import { STREAM_EVENTS } from "../shared/transport/seqStream.js";
 
 let pass = 0, fail = 0;
 const tests = [];
@@ -60,9 +62,9 @@ test("config: callbacks are mapped, rtc callbacks default to empty", () => {
 test("state: fresh instances never share mutable containers", () => {
   const a = initialState(), b = initialState();
   a._adapters.set("ws", 1);
-  a._buffer.push("x");
+  a._outLog.append({ event: "x", args: [] });
   assert.equal(b._adapters.size, 0);
-  assert.equal(b._buffer.length, 0);
+  assert.equal(b._outLog.nextSeq, 1, "rings must not be shared between instances");
   assert.equal(a._connected, false);
   assert.equal(a._type, "ws");
   assert.equal(a._connectionMode, "tunnel");
@@ -96,26 +98,28 @@ function makePm({ pick = null, adapters = {} } = {}) {
     _scheduleAckTimeout(id) { trace.push(["ackTimeout", id]); },
     _scheduleRtcRestart() { trace.push(["scheduleRtcRestart"]); },
     _sendControl(ev, args) { sendControl(pm, ev, args); },
+    _sendStreamEvent(ev, arg, ackId) { sendStreamEvent(pm, ev, arg, ackId); },
+    _seqActive: () => pm._peerSeqCtl === true,
     _canSignal: () => true,
-    _restartRtc() { trace.push(["restartRtc"]); }
+    _restartRtc() { trace.push(["restartRtc"]); },
+    _termLog() {}
   };
+  pm._intakeSeq = createIntakeFor(pm);
   return pm;
 }
 
-test("control: no adapter → buffered with its callback, flushed on the next adapter", () => {
+test("control: no adapter → the envelope stays in the ring, replay on open", () => {
   const pm = makePm();
   const cb = () => {};
   sendControl(pm, "resize", [{ cols: 80 }, cb]);
-  assert.equal(pm._buffer.length, 1);
-  assert.deepEqual(pm._buffer[0].args, [{ cols: 80 }]);
-  assert.equal(pm._buffer[0].cb, cb, "the ack must survive the buffering");
+  assert.equal(pm._outLog.nextSeq, 2, "logged even with no carrier");
+  assert.equal(pm._pendingAcks.size, 1, "the ack lives on the peer, not the carrier");
 
   const ws = adapter("ws");
   pm._pickAdapter = () => ws;
   flushBuffer(pm);
-  assert.equal(pm._buffer.length, 0);
+  assert.equal(ws.sent.length, 1);
   assert.deepEqual(ws.sent[0][1].args, [{ cols: 80 }]);
-  assert.equal(ws.sent[0][1].cb, cb);
 });
 
 test("control: an oversize payload still rides RTC — slicing is the adapter's job", () => {
@@ -128,13 +132,17 @@ test("control: an oversize payload still rides RTC — slicing is the adapter's 
   assert.equal(ws.sent.length, 0);
 });
 
-test("control: an RTC refusal is retried once, then dropped — never re-routed by hand", () => {
+test("control: a carrier refusal is NOT hand-routed — the ring replays on the next carrier", () => {
   const rtc = adapter("rtc", { sendOk: false });
   const ws = adapter("ws");
   const pm = makePm({ pick: rtc, adapters: { rtc, ws } });
   sendControl(pm, "input", ["hi"]);
-  assert.equal(ws.sent.length, 0, "a refusal must not silently move the message to the other carrier");
-  assert.equal(pm._buffer.length, 1, "undeliverable → buffered for the next ready window");
+  assert.equal(ws.sent.length, 0, "never silently move one message to the other carrier");
+
+  pm._pickAdapter = () => ws; // RTC died; the next open replays the unsent tail
+  flushBuffer(pm);
+  assert.equal(ws.sent.length, 1);
+  assert.equal(ws.sent[0][1].args[0], "hi");
 });
 
 test("control: undersize payload stays on RTC and registers an ack timeout", () => {
@@ -148,29 +156,6 @@ test("control: undersize payload stays on RTC and registers an ack timeout", () 
   assert.match(ackId, /^c_\d+$/);
   assert.equal(pm._pendingAcks.size, 1);
   assert.deepEqual(pm.trace, [["ackTimeout", ackId]]);
-});
-
-test("control: an RTC refusal is buffered, not re-routed — the flush uses the live carrier", () => {
-  const rtc = adapter("rtc", { sendOk: false });
-  const ws = adapter("ws");
-  const pm = makePm({ pick: rtc, adapters: { rtc, ws } });
-  const cb = () => {};
-  sendControl(pm, "input", ["hi", cb]);
-  assert.equal(ws.sent.length, 0, "a refusal must not silently move one message to the other carrier");
-  assert.equal(pm._buffer.length, 1);
-
-  pm._pickAdapter = () => ws; // the adapter state caught up: RTC is closed
-  flushBuffer(pm);
-  assert.equal(ws.sent.length, 1);
-  assert.equal(ws.sent[0][1].cb, cb, "the ack survives the buffering");
-});
-
-test("flush: a message the carrier refuses goes back to the buffer, and the flush ends", () => {
-  const rtc = adapter("rtc", { sendOk: false });
-  const pm = makePm({ pick: rtc, adapters: { rtc } });
-  pm._buffer.push({ event: "input", args: ["hi"], cb: null });
-  flushBuffer(pm); // must terminate: a re-read loop would spin on the refused message
-  assert.equal(pm._buffer.length, 1, "still undelivered — kept for the next ready window");
 });
 
 test("dispatch: __ack resolves the pending callback and clears its timer", () => {
@@ -208,6 +193,25 @@ test("dispatch: an app listener fires exactly once per event, on either carrier"
   assert.equal(app, 1, "WS delivery reaches the bus exactly once");
   dispatch(pm, "output", { args: ["y"] }, "rtc");
   assert.equal(app, 2, "RTC delivery reaches the same listener");
+});
+
+test("dispatch: a WS __env wrapper unwraps to the inner envelope (payload IS the wire)", () => {
+  const pm = makePm();
+  const seen = [];
+  pm._sockListeners.set("output", [(...a) => seen.push(a)]);
+  const wire = { event: "output", args: [{ id: 7 }], ackId: null, sq: 3, ep: "E", rs: 1 };
+  dispatch(pm, "__env", wire, "ws");
+  assert.deepEqual(seen, [[{ id: 7 }]], "the wrapper must never swallow the envelope");
+  assert.equal(pm._outLog.applied, 1, "peer rs watermark recorded");
+});
+
+test("dispatch: RTC bare lane data (tiles) arrives as the single first arg", () => {
+  const pm = makePm();
+  const seen = [];
+  pm._sockListeners.set("tiles-data", [(...a) => seen.push(a)]);
+  const tiles = { tiles: [1, 2], timestamp: 5, transport: "dc-stun" };
+  dispatch(pm, "tiles-data", tiles, "rtc");
+  assert.deepEqual(seen, [[tiles]], "tiles must reach the listener, not be flattened to []");
 });
 
 test("dispatch: device:approved clears the flag and renegotiates when rtc is dead", () => {
@@ -280,6 +284,66 @@ test("dispatch: tunnel:updated sets tunnelUrl and retries ws", () => {
   assert.equal(pm._auth.localIp, "192.168.1.10:2208");
   assert.equal(retried, true);
   assert.deepEqual(urlUpdate, { tunnelUrl: "https://new-tunnel.test", localIp: "192.168.1.10:2208" });
+});
+
+
+// ── a stale admission (host closed the connection under a live carrier) ──
+// The host answers a gated request with not-admitted. The request must not surface
+// as a failure: the PM re-dials once and re-sends it after device:approved.
+const fakeWs = () => {
+  const ws = { kicks: 0, forceReconnect() { ws.kicks++; } };
+  return ws;
+};
+const deliverAck = (pm, ackId, payload) =>
+  dispatch(pm, STREAM_EVENTS.ACK, { event: STREAM_EVENTS.ACK, args: [payload], ackId }, "rtc");
+
+test("not-admitted: the request is held, the carrier re-dialed, the caller not told", () => {
+  const ws = fakeWs();
+  const pm = makePm({ adapters: { ws } });
+  const answers = [];
+  sendControl(pm, "createSession", [{ name: "t" }, (res) => answers.push(res)]);
+  const [ackId] = [...pm._pendingAcks.keys()];
+  deliverAck(pm, ackId, { ok: false, success: false, error: "not-admitted" });
+  assert.deepEqual(answers, [], "a refusal the PM can repair is not the caller's failure");
+  assert.equal(ws.kicks, 1, "one re-dial to get a fresh admission");
+  assert.deepEqual(pm._admitQueue, [ackId]);
+});
+
+test("device:approved re-sends the held request, and its real answer reaches the caller", () => {
+  const ws = fakeWs();
+  const pm = makePm({ adapters: { ws } });
+  const answers = [];
+  sendControl(pm, "createSession", [{ name: "t" }, (res) => answers.push(res)]);
+  const [ackId] = [...pm._pendingAcks.keys()];
+  deliverAck(pm, ackId, { error: "not-admitted" });
+  const before = pm._outLog.nextSeq;
+  dispatch(pm, "device:approved", { event: "device:approved", args: [{}] }, "rtc");
+  assert.equal(pm._outLog.nextSeq, before + 1, "the held request is back in the ring");
+  deliverAck(pm, ackId, { success: true, sessionId: "s1" });
+  assert.deepEqual(answers, [{ success: true, sessionId: "s1" }]);
+  assert.equal(pm._ackReqs.has(ackId), false, "settled requests leave no copy behind");
+});
+
+test("not-admitted past the retry cap reaches the caller — never an endless loop", () => {
+  const pm = makePm({ adapters: { ws: fakeWs() } });
+  const answers = [];
+  sendControl(pm, "ai:prompt", [{ message: "hi" }, (res) => answers.push(res)]);
+  const [ackId] = [...pm._pendingAcks.keys()];
+  for (let i = 0; i < 3; i++) {
+    pm._admitKickAt = 0;
+    deliverAck(pm, ackId, { error: "not-admitted" });
+  }
+  assert.deepEqual(answers, [{ error: "not-admitted" }], "the UI's own lost-prompt path takes over");
+});
+
+test("a burst of refusals re-dials once, not per request", () => {
+  const ws = fakeWs();
+  const pm = makePm({ adapters: { ws } });
+  for (let i = 0; i < 5; i++) sendControl(pm, "getSessions", [() => {}]);
+  for (const id of [...pm._pendingAcks.keys()]) deliverAck(pm, id, { error: "not-admitted" });
+  dispatch(pm, "conn:notAdmitted", { event: "conn:notAdmitted", args: [{}] }, "rtc");
+  assert.equal(ws.kicks, 1, "one repair per episode");
+  assert.equal(pm._admitQueue.length, 5);
 });
 
 await Promise.all(tests);

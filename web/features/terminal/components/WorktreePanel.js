@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { createPortal } from "react-dom";
 import { GitBranch, GitFork, Plus, Trash2, Terminal, Search, Loader2, X } from "@/shared/components/ui/Icon";
 import { useI18n } from "@/shared/i18n";
 import { vibrate } from "@/shared/utils/vibration";
@@ -52,7 +53,7 @@ export default function WorktreePanel({ workspacePath, fileBus, homeDir, onNewTe
   const afterChange = () => {
     setError(null);
     load();
-    refreshWorkspaceGit(workspacePath);
+    refreshWorkspaceGit(workspacePath, fileBus);
     onChanged?.();
   };
 
@@ -103,7 +104,7 @@ export default function WorktreePanel({ workspacePath, fileBus, homeDir, onNewTe
 
       <div className="flex-1 min-h-0 overflow-y-auto modal-scrollable">
         {/* Worktrees */}
-        <div className="sticky top-0 z-10 px-2 py-1 flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-text-muted bg-surface-3 border-b border-border-subtle">
+        <div className="sticky top-0 z-10 px-2 py-1 flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-text-muted bg-surface-3/80 backdrop-blur-md">
           <GitFork size={11} />
           <span className="flex-1">{t("workspaces.worktrees")}</span>
           {loading ? <Loader2 size={11} className="animate-spin" /> : <span className="normal-case tracking-normal">{worktrees.length}</span>}
@@ -146,7 +147,7 @@ export default function WorktreePanel({ workspacePath, fileBus, homeDir, onNewTe
         ))}
 
         {/* Branches */}
-        <div className="sticky top-0 z-10 mt-3 px-2 py-1 flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-text-muted bg-surface-3 border-y border-border-subtle">
+        <div className="sticky top-0 z-10 mt-3 px-2 py-1 flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-text-muted bg-surface-3/80 backdrop-blur-md">
           <GitBranch size={11} />
           <span className="flex-1">{t("workspaces.branches")}</span>
           <span className="normal-case tracking-normal">{visible.length}</span>
@@ -193,9 +194,9 @@ export default function WorktreePanel({ workspacePath, fileBus, homeDir, onNewTe
       </div>
 
       {/* Add worktree */}
-      {addTarget && (
-        <div className="fixed inset-0 z-[80] flex items-center justify-center p-4 bg-black/60 backdrop-blur-[2px]" onClick={() => setAddTarget(null)}>
-          <div className="card-elev p-5 w-96" onClick={(e) => e.stopPropagation()}>
+      {addTarget && createPortal(
+        <div className="modal-overlay z-[80] scrim" onClick={() => setAddTarget(null)}>
+          <div className="card-elev p-5 w-96 max-w-full my-auto" onClick={(e) => e.stopPropagation()}>
             <h3 className="text-sm font-semibold text-text mb-1">{t("workspaces.addWorktree")}</h3>
             <p className="text-[11px] text-text-muted mb-3 truncate" title={addTarget.branch}>{addTarget.branch}</p>
             <label className="block text-[11px] text-text-muted mb-1">{t("workspaces.worktreePath")}</label>
@@ -222,7 +223,8 @@ export default function WorktreePanel({ workspacePath, fileBus, homeDir, onNewTe
               </button>
             </div>
           </div>
-        </div>
+        </div>,
+        document.body
       )}
 
       {/* Remove worktree — names the terminals that would lose their directory */}

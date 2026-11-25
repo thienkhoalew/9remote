@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import Icon from "@/shared/components/ui/Icon";
 import ConfirmDialog from "@/shared/components/ui/ConfirmDialog";
 import useClampedMenu from "@/shared/hooks/useClampedMenu";
@@ -53,7 +54,6 @@ export default function ExplorerPanel({
   const [newItemModal, setNewItemModal] = useState(null);
   const [newItemValue, setNewItemValue] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(null);
-  const [selectedFolder, setSelectedFolder] = useState(null);
   const [selectedPaths, setSelectedPaths] = useState(() => new Set());
   const selectionRef = useRef(selectedPaths);
   useEffect(() => { selectionRef.current = selectedPaths; }, [selectedPaths]);
@@ -85,6 +85,13 @@ export default function ExplorerPanel({
     showHidden, setShowHidden,
     loadDir, loadGitStatus, toggleFolder, expandDir, collapseAll, refreshAll
   } = useFileTreeState({ workspace, fileBus });
+
+  // Single selected folder is the create target; tree keys are loaded folders only.
+  const selectedFolder = useMemo(() => {
+    if (selectedPaths.size !== 1) return null;
+    const [path] = selectedPaths;
+    return tree.has(path) ? path : null;
+  }, [selectedPaths, tree]);
 
   const { createItem, renameItem, deleteItem, deleteMany, duplicateItem, moveTo, pasteInto } = useFileOperations({
     fileBus, loadDir, loadGitStatus, expandDir, onOpenFile,
@@ -246,7 +253,6 @@ export default function ExplorerPanel({
       setCursorPath(file.path);
       anchorRef.current = file.path;
       if (file.type === "folder") {
-        setSelectedFolder(file.path);
         toggleFolder(file);
       } else {
         onOpenFile?.(file.path);
@@ -633,7 +639,7 @@ export default function ExplorerPanel({
           if (os) setRootDragOver(true);
         }}
         onDragLeave={(e) => { if (!e.currentTarget.contains(e.relatedTarget)) setRootDragOver(false); }}
-        onClick={(e) => { if (e.target === e.currentTarget) { setSelectedPaths(new Set()); setSelectedFolder(null); } }}
+        onClick={(e) => { if (e.target === e.currentTarget) setSelectedPaths(new Set()); }}
         onDrop={(e) => {
           e.preventDefault();
           setRootDragOver(false);
@@ -661,7 +667,7 @@ export default function ExplorerPanel({
       {contextMenu && (
         <div
           ref={contextMenuRef}
-          className="fixed z-50 menu-popover p-1 min-w-[150px] animate-in fade-in zoom-in-95 duration-100"
+          className="fixed z-50 menu-popover p-1 min-w-[150px] pop-in"
           style={{ left: contextMenuPos.left, top: contextMenuPos.top }}
           onClick={(e) => e.stopPropagation()}
         >
@@ -684,10 +690,10 @@ export default function ExplorerPanel({
         </div>
       )}
 
-      {newItemModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-          <div className="absolute inset-0 bg-black/60 backdrop-blur-[2px] animate-in fade-in duration-150" onClick={() => setNewItemModal(null)} />
-          <div className="relative card-elev p-4 w-full max-w-sm animate-in zoom-in-95 duration-150">
+      {newItemModal && createPortal(
+        <div className="modal-overlay z-50">
+          <div className="absolute inset-0 scrim fade-in" onClick={() => setNewItemModal(null)} />
+          <div className="relative card-elev p-4 w-full max-w-sm my-auto pop-in">
             <h3 className="text-sm font-semibold text-text mb-2">
               {newItemModal.type === "folder" ? "New Folder" : "New File"}
             </h3>
@@ -736,7 +742,8 @@ export default function ExplorerPanel({
           </div>
           <input ref={pickFilesRef} type="file" multiple className="hidden" onChange={handlePickedFiles} />
           <input ref={pickFolderRef} type="file" webkitdirectory="" className="hidden" onChange={handlePickedFiles} />
-        </div>
+        </div>,
+        document.body
       )}
 
       {upload && (

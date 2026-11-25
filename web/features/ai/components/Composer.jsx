@@ -1,11 +1,15 @@
 "use client";
 
 import { memo, useState, useRef, useEffect, useCallback, useMemo } from "react";
-import { Send, Square, Terminal, FileCode, Zap, ChevronUp, Check, X, Paperclip, Mic, MicOff, History, Search } from "@/shared/components/ui/Icon";
+import { Send, Square, Terminal, FileCode, Folder, Zap, ChevronUp, Check, X, Paperclip, Mic, MicOff, History, Search, AlertCircle, RotateCw } from "@/shared/components/ui/Icon";
 import { ENGINE_INFO, SKIP_BEHAVIOR, SKIP_MESSAGE } from "../constants";
 import { getEngineConfig } from "../registry";
 import { buildSlashItems } from "../lib/slashMenu";
 import { buildModelSections } from "../lib/modelSections";
+import { getPathIndex, searchPathIndex } from "../lib/pathIndex";
+import { removePendingWithin } from "../lib/pendingPrompts";
+import { rankPaths, tokenAtCaret, formatMention, pathBase, FUZZY_PATH } from "@/shared/utils/fuzzyPath";
+import { MentionRow } from "./MentionRow";
 import { vibrate } from "@/shared/utils/vibration";
 import { useAiStore } from "@/shared/stores/aiStore";
 import { useConnectionStore } from "@/shared/stores/connectionStore";
@@ -23,6 +27,14 @@ import VoicePill from "@/shared/components/ui/VoicePill";
 const EMPTY_ARRAY = [];
 // Only long lists (omp catalogs hundreds of models) get the inline search box.
 const MODEL_MENU_SEARCH_MIN = 20;
+// Rows in the `@` file picker before it scrolls.
+const MENU_MAX_ITEMS = FUZZY_PATH.maxResults;
+// Below this, a host search matches nearly every path and the reply is noise.
+const HOST_SEARCH_MIN_QUERY = 2;
+// Window after a send in which an IME re-commit of the sent text is dropped.
+const SENT_ECHO_MS = 200;
+// A healthy send echoes well under this; only a slow one earns the "Sending…" line.
+const SENDING_HINT_DELAY_MS = 1500;
 
 export const Composer = memo(function Composer({
   sessionId = "",
@@ -41,7 +53,6 @@ export const Composer = memo(function Composer({
   onOpenModal,
   onOptionChange,
   onActivate,
-  fileBus = null,
   workspacePath = "",
   model: propModel = "",
   modalOpen = false
@@ -71,15 +82,24 @@ export const Composer = memo(function Composer({
   const queue = useAiStore((s) => s.bySession[sessionId]?.queue) || EMPTY_ARRAY;
   // #48: prompt lost to a dead carrier — the bar offers Resend.
   const promptError = useAiStore((s) => s.bySession[sessionId]?.promptError) || null;
+  const promptSending = useAiStore((s) => s.bySession[sessionId]?.promptSending) || null;
+  const [showSending, setShowSending] = useState(false);
+  useEffect(() => {
+    setShowSending(false);
+    if (!promptSending) return;
+    const timer = setTimeout(() => setShowSending(true), SENDING_HINT_DELAY_MS);
+    return () => clearTimeout(timer);
+  }, [promptSending]);
   const [historyIdx, setHistoryIdx] = useState(-1);
   const draftRef = useRef("");
   const [menuOpen, setMenuOpen] = useState(false);
   const [menuType, setMenuType] = useState(null); // "/" or "@"
-  const [menuFilter, setMenuFilter] = useState("");
   const [menuItems, setMenuItems] = useState([]);
   const [selectedIdx, setSelectedIdx] = useState(0);
   const [submenuCmd, setSubmenuCmd] = useState(null);
   const [suggestActive, setSuggestActive] = useState(-1);
+  // Caret drives the `@`/`/` token, so moving it with arrows must re-rank too.
+  const [caret, setCaret] = useState(0);
 
   const addCommand = useAiHistoryStore((s) => s.addCommand);
   const resolveAlias = useAiHistoryStore((s) => s.resolveAlias);
@@ -151,6 +171,8 @@ export const Composer = memo(function Composer({
   const lastCompositionEndRef = useRef(0);
   const lastSendTimeRef = useRef(0);
   const justSentRef = useRef(0);
+  // What was just sent — the IME echo guard drops only this, never fresh typing.
+  const sentTextRef = useRef("");
   const engineMeta = ENGINE_INFO[engine] || ENGINE_INFO.claude;
 
   // Auto-focus input on desktop when pane becomes active.
@@ -237,27 +259,24 @@ export const Composer = memo(function Composer({
   }, [text, sessionId]);
 
   useEffect(() => {
-    // Keep submenu open while text ends in the triggering command.
+    // Keep submenu open while the text still ends in the triggering command.
     if (submenuCmd) {
       const escaped = submenuCmd.name.replace(/[/@]/g, "\\$&");
       if (new RegExp(`(?:^|\\s)${escaped}\\s*$`).test(text)) return;
       setSubmenuCmd(null);
     }
 
-    const lastWordMatch = /(?:^|\s)([/@][\w\d_.-]*)$/.exec(text);
-    if (!lastWordMatch) {
+    // Token under the caret, not at the end of the prompt: a coder edits mid-sentence.
+    const tokenHit = tokenAtCaret(text, caret);
+    if (!tokenHit) {
       setMenuOpen(false);
       setMenuType(null);
-      setMenuFilter("");
       return;
     }
 
-    const token = lastWordMatch[1];
-    const trigger = token[0];
-    const filter = token.slice(1).toLowerCase();
-
+    const { trigger, query } = tokenHit;
+    const filter = query.toLowerCase();
     setMenuType(trigger);
-    setMenuFilter(filter);
     setSelectedIdx(0);
 
     if (trigger === "/") {
@@ -270,33 +289,57 @@ export const Composer = memo(function Composer({
       });
       setMenuItems(filtered);
       setMenuOpen(filtered.length > 0);
-    } else if (trigger === "@") {
-      const b = bus;
-      if (b?.emit) {
-        b.emit("ai:files", { workspace: workspacePath, query: filter }, (res) => {
-          if (res?.ok && Array.isArray(res.files)) {
-            setMenuItems(
-              res.files.map((f) => ({
-                name: f.path || f,
-                description: f.isModified ? `${f.dir ? f.dir + " · " : ""}modified` : (f.dir || "")
-              }))
-            );
-            setMenuOpen(res.files.length > 0);
-          }
-        });
-      } else if (fileBus?.searchFiles && workspacePath) {
-        fileBus.searchFiles(workspacePath, filter).then((res) => {
-          if (res?.success && Array.isArray(res.files)) {
-            setMenuItems(res.files.slice(0, 10).map((f) => ({ name: f.path || f, description: f.relPath || f })));
-            setMenuOpen(res.files.length > 0);
-          }
-        });
-      } else {
+      return;
+    }
+
+    // `@`: rank locally against the cached index so a keystroke never waits on a round-trip.
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      if (!workspacePath) {
         setMenuItems([]);
         setMenuOpen(false);
+        return;
       }
-    }
-  }, [text, fileBus, workspacePath, storeSkills, storeCommands, SLASH_COMMANDS, submenuCmd]);
+      let index = await getPathIndex(bus, workspacePath);
+      if (cancelled) return;
+      if (!index) {
+        setMenuItems([]);
+        setMenuOpen(false);
+        return;
+      }
+      let ranked = rankPaths(index, query, MENU_MAX_ITEMS);
+      // A trimmed index cannot see paths it never shipped, so a weak local answer may
+      // be missing the right file. "Strong" means the top row's basename literally
+      // starts with the query — that is the case a missing file could not beat.
+      const top = ranked[0];
+      const confident = top && !top.isDir
+        && pathBase(top.path).toLowerCase().startsWith(query.toLowerCase());
+      if (index.truncated && query.length >= HOST_SEARCH_MIN_QUERY && !confident) {
+        const hostHits = await searchPathIndex(bus, workspacePath, query);
+        if (cancelled) return;
+        if (hostHits) {
+          const merged = rankPaths(hostHits, query, MENU_MAX_ITEMS);
+          const seen = new Set(ranked.map((r) => r.path));
+          ranked = [...ranked, ...merged.filter((m) => !seen.has(m.path))]
+            .sort((a, b) => b.score - a.score || a.path.length - b.path.length)
+            .slice(0, MENU_MAX_ITEMS);
+        }
+      }
+      setMenuItems(ranked.map((hit) => ({
+        name: hit.path,
+        label: hit.path,
+        isDir: hit.isDir,
+        isModified: hit.isModified,
+        positions: hit.positions
+      })));
+      setMenuOpen(ranked.length > 0);
+    }, FUZZY_PATH.debounceMs);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [text, caret, bus, workspacePath, storeSkills, storeCommands, SLASH_COMMANDS, submenuCmd]);
 
   const executeSend = useCallback((overrideText) => {
     const raw = typeof overrideText === "string" ? overrideText : (textareaRef.current ? textareaRef.current.value : text);
@@ -307,6 +350,7 @@ export const Composer = memo(function Composer({
     if (now - lastSendTimeRef.current < 250) return;
     lastSendTimeRef.current = now;
     justSentRef.current = now;
+    sentTextRef.current = (raw || text).trim();
 
     vibrate();
     if (trimmed) {
@@ -320,8 +364,9 @@ export const Composer = memo(function Composer({
     }
     try { localStorage.removeItem(`9remote_draft_${sessionId}`); } catch {}
 
+    // Attachments stay staged for the next prompt; the command still runs.
     if (trimmed.startsWith("!")) {
-      if (!pending.length) onRunShell?.(trimmed.slice(1).trim());
+      onRunShell?.(trimmed.slice(1).trim());
       return;
     }
 
@@ -335,6 +380,10 @@ export const Composer = memo(function Composer({
     });
   }, [text, sessionId, onSend, onRunShell, onResolvePermission, setAttachments, addCommand, resolveAlias]);
 
+  // A mobile IME may re-commit the text it held right after the clear.
+  const isSentEcho = (value) => Date.now() - justSentRef.current < SENT_ECHO_MS
+    && Boolean(value?.trim()) && value.trim() === sentTextRef.current;
+
   const handleStopClick = useCallback(() => {
     vibrate();
     onStop?.();
@@ -345,9 +394,22 @@ export const Composer = memo(function Composer({
     if (!lost) return;
     vibrate();
     useAiStore.getState().clearPromptError(sessionId);
-    onSend?.(lost.text);
+    // The resend records itself again; older entries folded into this text must go.
+    removePendingWithin(sessionId, lost.text);
+    onSend?.(lost.text, { attachments: lost.attachments || null, promptId: lost.promptId || null });
   }, [sessionId, onSend]);
+  // Put the lost prompt back in the box so it can be edited, not retyped.
+  const editLostPrompt = useCallback(() => {
+    const lost = useAiStore.getState().bySession[sessionId]?.promptError;
+    if (!lost) return;
+    useAiStore.getState().clearPromptError(sessionId);
+    removePendingWithin(sessionId, lost.text);
+    setText((prev) => (prev.trim() ? `${lost.text}\n${prev}` : lost.text));
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  }, [sessionId]);
   const dismissPromptError = useCallback(() => {
+    const lost = useAiStore.getState().bySession[sessionId]?.promptError;
+    if (lost) removePendingWithin(sessionId, lost.text);
     useAiStore.getState().clearPromptError(sessionId);
   }, [sessionId]);
 
@@ -380,14 +442,34 @@ export const Composer = memo(function Composer({
 
   const selectMenuItem = useCallback((item) => {
     vibrate();
-    const lastWordMatch = /(?:^|\s)([/@][\w\d_.-]*)$/.exec(text);
-    if (!lastWordMatch) return;
+    const tokenHit = tokenAtCaret(text, caret);
+    if (!tokenHit) return;
 
-    const token = lastWordMatch[1];
-    const prefix = text.slice(0, text.length - token.length);
+    const prefix = text.slice(0, tokenHit.start);
+    const suffix = text.slice(tokenHit.end);
     const opensModal = menuType === "/" && item.action?.startsWith("modal:");
-    const replacement = menuType === "@" ? `@${item.name} ` : `${item.name} `;
-    setText(opensModal ? prefix : `${prefix}${replacement}`);
+    let replacement;
+    if (menuType === "@") {
+      // A folder completes to `@dir/` and keeps the picker open for the next segment.
+      if (item.isDir) {
+        replacement = `@${formatMention(item.name)}/`;
+      } else {
+        replacement = `@${formatMention(item.name)} `;
+      }
+    } else {
+      replacement = `${item.name} `;
+    }
+    const next = opensModal ? prefix + suffix : `${prefix}${replacement}${suffix}`;
+    setText(next);
+    if (!opensModal) {
+      const caretAfter = prefix.length + replacement.length;
+      setCaret(caretAfter);
+      requestAnimationFrame(() => {
+        const el = textareaRef.current;
+        if (!el) return;
+        el.setSelectionRange(caretAfter, caretAfter);
+      });
+    }
     setMenuOpen(false);
 
     if (menuType !== "/") {
@@ -405,7 +487,7 @@ export const Composer = memo(function Composer({
       return;
     }
     runSlashAction(item);
-  }, [text, menuType, runSlashAction, isTurnRunning]);
+  }, [text, caret, menuType, runSlashAction, isTurnRunning]);
 
   const selectSubOption = useCallback((option) => {
     vibrate();
@@ -644,15 +726,31 @@ export const Composer = memo(function Composer({
     return own.length > 0 ? own : tierSpec?.subOptions || [];
   }, [tierSpec, matchedModel]);
 
-  return (    <div className="relative px-3 py-1.5 bg-transparent border-t border-border-subtle/40 select-none">
+  // No rule above the composer: the input already draws its own box, so a hairline
+  // here made a second frame line right beside it.
+  return (    <div className="relative px-3 py-1.5 bg-transparent select-none">
+      {showSending && promptSending && !promptError && (
+        <div className="flex items-center gap-2 mb-1 px-2.5 py-1.5 text-xs rounded-brand bg-brand-500/10 border border-brand-500/25">
+          <span className="w-2 h-2 rounded-full bg-brand-500 animate-pulse shrink-0" />
+          <span className="shrink-0 font-medium text-brand-500">{t("common.sending")}</span>
+          <span className="truncate min-w-0 text-text-muted">{promptSending.text}</span>
+        </div>
+      )}
       {/* Prompt lost to a dead carrier (#48) — say so, offer the text back */}
       {promptError && (
-        <div className="flex items-center gap-2 mb-1 px-2 py-1 text-xs text-text-muted bg-surface border border-border-subtle rounded-brand">
-          <span className="truncate">
-            {t("common.promptNotSent")}{promptError.reason && promptError.reason !== "timeout" ? `: ${promptError.reason}` : ""}
+        <div className="flex items-center gap-2 mb-1 px-2.5 py-1.5 text-xs bg-danger/10 border border-danger/30 rounded-brand">
+          <AlertCircle size={13} className="shrink-0 text-danger" />
+          <span className="truncate min-w-0 text-text" title={promptError.text}>
+            {promptError.reason === "reload" ? t("common.promptRecovered")
+              : `${t("common.promptNotSent")}${promptError.reason && promptError.reason !== "timeout" ? `: ${promptError.reason}` : ""}`}
+            {promptError.text ? <span className="text-text-muted"> — {promptError.text}</span> : null}
           </span>
-          <button type="button" onClick={resendLostPrompt} className="shrink-0 text-text-muted hover:text-text underline underline-offset-2">
+          <button type="button" onClick={resendLostPrompt} className="shrink-0 inline-flex items-center gap-1 px-2 py-1 text-[11px] font-semibold text-white bg-brand-500 hover:bg-brand-600 rounded-brand transition-colors">
+            <RotateCw size={11} />
             {t("common.resend")}
+          </button>
+          <button type="button" onClick={editLostPrompt} className="shrink-0 px-2 py-1 text-[11px] text-text-muted hover:text-text border border-border-subtle rounded-brand transition-colors">
+            {t("common.edit")}
           </button>
           <button type="button" onClick={dismissPromptError} className="shrink-0 text-text-muted hover:text-text">
             <X size={11} />
@@ -663,7 +761,7 @@ export const Composer = memo(function Composer({
       {menuOpen && submenuCmd && (
         <div
           ref={menuContainerRef}
-          className="absolute left-3 right-3 bottom-[calc(100%+6px)] max-h-52 bg-surface border border-border-subtle rounded-brand shadow-lg overflow-y-auto z-50 p-1 custom-scrollbar"
+          className="absolute left-3 right-3 bottom-[calc(100%+6px)] max-h-52 menu-popover overflow-y-auto z-50 p-1 custom-scrollbar"
         >
           <div className="px-2 py-0.5 text-[10px] text-text-muted font-mono uppercase tracking-wider border-b border-border-subtle mb-1 flex items-center justify-between">
             <span>{submenuCmd.name} — {submenuCmd.optionKey}</span>
@@ -698,7 +796,7 @@ export const Composer = memo(function Composer({
       {menuOpen && !submenuCmd && menuItems.length > 0 && (
         <div
           ref={menuContainerRef}
-          className="absolute left-3 right-3 bottom-[calc(100%+6px)] max-h-52 bg-surface border border-border-subtle rounded-brand shadow-lg overflow-y-auto z-50 p-1 custom-scrollbar"
+          className="absolute left-3 right-3 bottom-[calc(100%+6px)] max-h-52 menu-popover overflow-y-auto z-50 p-1 custom-scrollbar"
         >
           <div className="px-2 py-0.5 text-[10px] text-text-muted font-mono uppercase tracking-wider border-b border-border-subtle mb-1">
             {menuType === "/" ? "Slash Commands & Skills" : "Files in repo (@)"}
@@ -721,15 +819,21 @@ export const Composer = memo(function Composer({
                 }`}
                 title={isBlocked ? "Cannot change while turn is running" : undefined}
               >
-                <div className="flex items-center gap-2 truncate">
+                <div className="flex items-center gap-2 truncate min-w-0">
                   {item.isSkill ? (
                     <Zap size={12} className="text-warning shrink-0" />
                   ) : menuType === "/" ? (
                     <Terminal size={12} className="text-accent shrink-0" />
+                  ) : item.isDir ? (
+                    <Folder size={12} className="text-brand-500 shrink-0" />
                   ) : (
                     <FileCode size={12} className="text-accent shrink-0" />
                   )}
-                  <span className="font-mono text-xs text-text">{item.name}</span>
+                  {menuType === "@" && !item.isSkill ? (
+                    <MentionRow item={item} />
+                  ) : (
+                    <span className="font-mono text-xs text-text">{item.name}</span>
+                  )}
                   {item.isSkill && (
                     <span className="text-[9px] px-1 rounded bg-warning/15 text-warning font-mono">
                       skill
@@ -739,9 +843,19 @@ export const Composer = memo(function Composer({
                     <ChevronUp size={11} className="text-text-muted shrink-0 rotate-90" />
                   )}
                 </div>
-                {item.description && (
+                {item.description && menuType !== "@" && (
                   <span className="text-[10px] text-text-muted truncate ml-2 max-w-[50%]">
                     {item.description}
+                  </span>
+                )}
+                {menuType === "@" && !item.isSkill && (
+                  <span className="flex items-center gap-1.5 shrink-0 ml-2">
+                    {item.isModified && (
+                      <span className="w-1.5 h-1.5 rounded-full bg-warning" title="modified" />
+                    )}
+                    {item.isDir && (
+                      <span className="text-[10px] text-text-muted font-mono">/</span>
+                    )}
                   </span>
                 )}
               </div>
@@ -800,7 +914,7 @@ export const Composer = memo(function Composer({
 
       <VoicePill voice={voice} onDone={handleVoiceDone} onCancel={handleVoiceCancel} className="mb-1.5" />
 
-      <div className="relative rounded-brand border border-border-subtle/80 bg-transparent focus-within:border-brand-500 transition-colors px-2.5 py-1 flex flex-col gap-1">
+      <div className="relative rounded-brand border border-border-composer bg-transparent focus-within:border-brand-500 transition-colors px-2.5 py-1 flex flex-col gap-1">
         {attachments.length > 0 && (
           <div className="flex gap-1.5 overflow-x-auto scroll-thin-x pt-0.5">
             {attachments.map((att) => (
@@ -845,20 +959,28 @@ export const Composer = memo(function Composer({
             value={text}
             onPaste={handleAttachPaste}
             onChange={(e) => {
-              if (Date.now() - justSentRef.current < 200) {
+              if (isSentEcho(e.target.value)) {
                 if (textareaRef.current) textareaRef.current.value = "";
                 return;
               }
               setText(e.target.value);
+              setCaret(e.target.selectionStart ?? e.target.value.length);
               setSuggestActive(-1);
             }}
             onFocus={() => onActivate?.()}
+            onSelect={(e) => setCaret(e.currentTarget.selectionStart)}
+            onKeyUp={(e) => {
+              // Arrow/Home/End move the caret without changing the text.
+              if (e.key.startsWith("Arrow") || e.key === "Home" || e.key === "End") {
+                setCaret(e.currentTarget.selectionStart);
+              }
+            }}
             onKeyDown={handleKeyDown}
             onCompositionStart={() => { isComposingRef.current = true; }}
             onCompositionEnd={() => {
               isComposingRef.current = false;
               lastCompositionEndRef.current = Date.now();
-              if (Date.now() - justSentRef.current < 200) {
+              if (isSentEcho(textareaRef.current?.value)) {
                 if (textareaRef.current) textareaRef.current.value = "";
                 setText("");
               }
@@ -893,8 +1015,9 @@ export const Composer = memo(function Composer({
           )}
         </div>
 
-        {/* Action strip: Model selector, Mode selector & Send button */}
-        <div className="relative flex items-center justify-between text-xs pt-0.5 border-t border-border-subtle/30">
+        {/* Action strip: Model selector, Mode selector & Send button — separated by
+            space, not a rule; the box border above already frames it. */}
+        <div className="relative flex items-center justify-between text-xs pt-1">
           <div className="flex items-center gap-1.5 flex-1 min-w-0">
             <div ref={modelMenuRef} className="relative min-w-0 flex items-center gap-1">
               <button

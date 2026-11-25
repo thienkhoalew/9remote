@@ -25,8 +25,9 @@ import { AiQuestionCard } from "./cards/AiQuestionCard";
 import { AiTaskCard } from "./cards/AiTaskCard";
 import { AiAgentStrip } from "./AiAgentStrip";
 import { AiPaneScope } from "./PaneScope";
+import ConfirmDialog from "@/shared/components/ui/ConfirmDialog";
 import { getEngineConfig } from "../registry";
-import { AI_FONT_SIZE_BOOST, AI_FONT_SIZE_BOOST_MOBILE, AI_DOT_GRID, ENGINE_INFO } from "../constants";
+import { AI_FONT_SIZE_BOOST, AI_FONT_SIZE_BOOST_MOBILE, chatCanvasStyle, ENGINE_INFO } from "../constants";
 import { useSessionStatus } from "@/shared/transport/hostConn";
 import { dotClassName, statusVisual } from "@/shared/utils/statusVisual";
 import { STATUS_BAR_HEIGHT } from "@/shared/constants/layout";
@@ -72,7 +73,11 @@ export const AiPaneView = memo(function AiPaneView({
   const [activeModal, setActiveModal] = useState(null); // 'skills' | 'mcp' | 'model'
   const [refreshing, setRefreshing] = useState(false);
   const [noteModalOpen, setNoteModalOpen] = useState(false);
+  const [confirmNewChat, setConfirmNewChat] = useState(false);
   const { t } = useI18n();
+
+  // New chat replaces (closes) the current one — one stray tap must not do that.
+  const requestNewChat = useCallback(() => setConfirmNewChat(true), []);
 
   const { sendPrompt, removeQueueItem, clearQueue, resolvePermission, stop, stopTask, runShell, rewindToMessage, previewRewind, listRewindPoints, escalateMode, dismissBlocked, hasOlder, loadOlder, reload, hydrating, synced, hydrateFailed } = useAiSession({
     sessionId,
@@ -129,24 +134,31 @@ export const AiPaneView = memo(function AiPaneView({
     [fontSize, isDesktop]
   );
 
-  // Background styling: a picked terminal wallpaper wins over the palette colour,
-  // mirroring TerminalPane — including its dark-mode-only rule, since the veil is
-  // tuned for a dark ground. The dot grid sits on top either way.
+  // Background styling: a picked terminal wallpaper still wins, mirroring
+  // TerminalPane — including its dark-mode-only rule, since the veil is tuned for a
+  // dark ground. Without one the pane paints a chat canvas: an icon wallpaper tile,
+  // a pool of light and a tilted band, on the app's own neutral greys. The terminal
+  // palette only supplies text colour here — a chat is not a terminal.
   const bgStyle = useMemo(() => {
-    const { alpha, size } = AI_DOT_GRID;
-    const dotGrid = `radial-gradient(color-mix(in srgb, ${palette.foreground} ${alpha}%, transparent) 1px, transparent 1px) 0 0 / ${size}px ${size}px`;
     const paneBgKey = resolvePaneBackground(sessionBgKey, terminalBackgrounds, customBackgrounds, bgIndex);
     const bgSrc = theme === "dark" ? backgroundSrc(paneBgKey, customBackgrounds) : null;
     if (bgSrc) {
       const veil = `rgba(${TERMINAL_BG_VEIL_RGB},${terminalBackgroundOpacity ?? TERMINAL_BG_ALPHA})`;
       const lift = `rgba(${TERMINAL_BG_LIFT_RGB},${TERMINAL_BG_LIFT})`;
       return {
-        background: `${dotGrid}, linear-gradient(${veil},${veil}), linear-gradient(${lift},${lift}), center / cover no-repeat url("${bgSrc}")`,
-        backgroundBlendMode: "luminosity, normal, screen, normal"
+        backgroundColor: palette.background,
+        backgroundImage: `linear-gradient(${veil},${veil}), linear-gradient(${lift},${lift}), url("${bgSrc}")`,
+        backgroundSize: "100% 100%, 100% 100%, cover",
+        backgroundPosition: "0 0, 0 0, center",
+        backgroundRepeat: "no-repeat, no-repeat, no-repeat",
+        backgroundBlendMode: "normal, screen, normal"
       };
     }
-    return { background: `${dotGrid}, ${palette.background}` };
-  }, [terminalBackgrounds, sessionBgKey, customBackgrounds, terminalBackgroundOpacity, palette, theme, bgIndex]);
+    // Mobile paints the canvas once in the workspace shell, full-bleed — repainting
+    // it here would restart the tile and the pool at the pane's top edge.
+    if (!isDesktop) return { backgroundColor: "transparent" };
+    return chatCanvasStyle(theme);
+  }, [terminalBackgrounds, sessionBgKey, customBackgrounds, terminalBackgroundOpacity, palette, theme, bgIndex, isDesktop]);
 
   const skills = metadata.skills || [];
   const mcpServers = metadata.mcpServers || [];
@@ -230,7 +242,7 @@ export const AiPaneView = memo(function AiPaneView({
   // A control inside the pane handles its own pointer; only empty space activates.
   const panePointer = makePanePointerHandlers({
     isFocused,
-    onActivate: () => onActivate?.()
+    onActivate: () => onActivate?.(sessionId)
   });
 
   // Everything below reads this rather than a document-wide lookup: panes stay mounted
@@ -240,11 +252,12 @@ export const AiPaneView = memo(function AiPaneView({
   // background pane never sees a tap on a question card's button. Deliberately touching a
   // card in another chat is choosing that chat, which is what activation means.
   //
-  // Behind a ref so the scope object keeps its identity: the caller passes an inline arrow,
+  // Behind a ref so the scope object keeps its identity: the caller passes one shared
+  // handler for every pane (activation means "select the session that owns this chat"),
   // and a scope rebuilt every workspace render would re-render every card in every pane.
   const onActivateRef = useRef(onActivate);
   useEffect(() => { onActivateRef.current = onActivate; });
-  const activate = useCallback(() => onActivateRef.current?.(), []);
+  const activate = useCallback(() => onActivateRef.current?.(sessionId), [sessionId]);
   const paneScope = useMemo(() => ({ sessionId, isFocused, activate }), [sessionId, isFocused, activate]);
 
   return (
@@ -264,7 +277,7 @@ export const AiPaneView = memo(function AiPaneView({
           strip naming the session and carrying Remote/Mobile/Sites, and a phone does not. */}
       <div
         style={{ height: STATUS_BAR_HEIGHT }}
-        className="sm:hidden flex items-center gap-2 px-2 border-b border-border-subtle bg-surface/70 backdrop-blur-sm text-[11px] select-none shrink-0 relative z-10"
+        className="sm:hidden flex items-center gap-2 px-2 bg-surface/80 backdrop-blur-md text-[11px] select-none shrink-0 relative z-10"
       >
         <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${dotClassName(sessionState)}`} style={{ background: statusVisual(sessionState).dot }} />
         <span className="flex-1 min-w-0 truncate text-text">{sessionName || ENGINE_INFO[engine]?.label || engine}</span>
@@ -369,7 +382,7 @@ export const AiPaneView = memo(function AiPaneView({
 
       {/* Pinned blocked-action card: engines that cannot hold a gate (codex, antigravity) get a mode escalation */}
       {activeBlocked && !activePermission && (
-        <div className="px-3 pb-2 select-none animate-in fade-in slide-in-from-bottom-2 duration-150 flex-shrink-0 z-30">
+        <div className="px-3 pb-2 select-none list-rise flex-shrink-0 z-30">
           <AiBlockedCard
             engine={activeBlocked.engine || engine}
             message={activeBlocked.message}
@@ -382,7 +395,7 @@ export const AiPaneView = memo(function AiPaneView({
 
       {/* Pinned Active Permission or Question Gate directly above composer */}
       {activePermission && (
-        <div className="px-3 pb-2 select-none animate-in fade-in slide-in-from-bottom-2 duration-150 flex-shrink-0 z-30">
+        <div className="px-3 pb-2 select-none list-rise flex-shrink-0 z-30">
           {activePermission.tool === "AskUserQuestion" ? (
             <AiQuestionCard
               requestId={activePermission.requestId}
@@ -418,9 +431,8 @@ export const AiPaneView = memo(function AiPaneView({
         onModeChange={handleModeChange}
         onOpenModal={setActiveModal}
         onOptionChange={handleOptionChange}
-        onActivate={onActivate}
+        onActivate={activate}
         isFocused={isFocused}
-        fileBus={fileBus}
         workspacePath={workspacePath}
         modalOpen={activeModal !== null}
       />
@@ -434,7 +446,7 @@ export const AiPaneView = memo(function AiPaneView({
         workspacePath={workspacePath}
         isDesktop={isDesktop}
         onModeChange={handleModeChange}
-        onNewChat={onNewChat}
+        onNewChat={requestNewChat}
       />
 
       {/* Modals. Skills/MCP lost their status-bar buttons but keep the slash entries
@@ -528,6 +540,15 @@ export const AiPaneView = memo(function AiPaneView({
           onClose={() => setNoteModalOpen(false)}
         />
       )}
+
+      <ConfirmDialog
+        isOpen={confirmNewChat}
+        onClose={() => setConfirmNewChat(false)}
+        onConfirm={() => onNewChat?.(sessionId)}
+        title={t("ai.newChatTitle")}
+        message={t("ai.newChatMessage")}
+        confirmText={t("ai.newChatConfirm")}
+      />
     </div>
     </AiPaneScope.Provider>
   );

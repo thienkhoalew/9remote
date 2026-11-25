@@ -2,7 +2,7 @@
 
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import {
-  ChevronLeft, ChevronRight, Menu, PanelLeft, PanelRight, Settings, Monitor, Smartphone, Plus, Pencil, Trash2, X, Globe, RotateCw, Github, Star, Bot, Zap, Check, Image as ImageIcon, Sparkles, Maximize2, Minimize2, Eye, EyeOff, Columns2, Link2, Loader2
+  ChevronLeft, ChevronRight, Menu, PanelLeft, PanelRight, Monitor, Smartphone, Plus, Pencil, Trash2, X, Globe, RotateCw, Github, Star, Bot, Zap, Check, Image as ImageIcon, Sparkles, Maximize2, Minimize2, Eye, EyeOff, Columns2, Link2, Loader2
 } from "@/shared/components/ui/Icon";
 import NotificationsBell from "./NotificationsBell";
 import SessionStatusBadge from "./SessionStatusBadge";
@@ -233,7 +233,6 @@ function TerminalHeader({
 
   // Actions only (stable identities): this component WRITES context/callbacks, so
   // subscribing to the whole store would re-render it on its own every write.
-  const openMenu = useSlideMenuStore((s) => s.open);
   // Hidden by id rather than listed by id, so a button added later shows up
   // instead of being invisible until the user finds the setting.
   const hiddenHeaderButtons = useTerminalStore((s) => s.hiddenHeaderButtons);
@@ -426,7 +425,7 @@ function TerminalHeader({
   }, [isActive, connected, onOpenRemote, onOpenFiles, onLogout, tunnelUrl, apiKey, connectionMode, hostVersion, agentVersion, busRef, carrier, subscribeToPush, unsubscribeFromPush, setContext, setCallbacks]);
 
   return (
-    <div className={`h-9 ${PANEL_HEADER_H_CLASS} px-2 sm:pl-0 sm:pr-2 flex items-stretch gap-0 flex-shrink-0 bg-bg border-b border-border-subtle`}>
+    <div className={`${isDesktop ? "terminal-header-glass border-b border-border-subtle" : "terminal-header-veil"} h-9 ${PANEL_HEADER_H_CLASS} px-2 sm:pl-0 sm:pr-2 flex items-stretch gap-0 flex-shrink-0`}>
       {onToggleSidebar && sidebarCollapsed && (
         <button
           onClick={() => { vibrate(); onToggleSidebar(); }}
@@ -493,7 +492,7 @@ function TerminalHeader({
                 onTouchStart={(e) => handleTabTouchStart(e, session)}
                 onTouchMove={clearTabLongPress}
                 onTouchEnd={clearTabLongPress}
-                className={`term-tab group relative px-1.5 sm:px-2.5 text-xs font-medium duration-150 ease-out flex items-center gap-1 sm:gap-2 whitespace-nowrap h-full cursor-pointer select-none touch-manipulation touch-pan-x ${
+                className={`term-tab ${isDesktop ? "" : "term-tab-flat"} group relative px-1.5 sm:px-2.5 text-xs font-medium duration-150 ease-out flex items-center gap-1 sm:gap-2 whitespace-nowrap h-full cursor-pointer select-none touch-manipulation touch-pan-x ${
                   isActiveTab ? "term-tab-active" : ""
                 } ${isHidden ? "opacity-75 hover:opacity-100" : ""} ${dragId === session.id ? "z-20 opacity-90 shadow-lg" : "transition"}`}
               >
@@ -584,7 +583,7 @@ function TerminalHeader({
                     pushView({ type: "browser" });
                   }
                 }}
-                className={`term-tab group relative px-1.5 sm:px-2.5 text-xs font-medium flex items-center gap-1 sm:gap-2 whitespace-nowrap h-full cursor-pointer select-none touch-manipulation touch-pan-x ${
+                className={`term-tab ${isDesktop ? "" : "term-tab-flat"} group relative px-1.5 sm:px-2.5 text-xs font-medium flex items-center gap-1 sm:gap-2 whitespace-nowrap h-full cursor-pointer select-none touch-manipulation touch-pan-x ${
                   isActive ? "term-tab-active" : ""
                 }`}
               >
@@ -635,7 +634,7 @@ function TerminalHeader({
                   pickAgentTab(tab);
                 }
               }}
-              className="term-tab group relative px-1.5 sm:px-2.5 text-xs font-medium flex items-center gap-1 sm:gap-2 whitespace-nowrap h-full cursor-pointer select-none touch-manipulation"
+              className={`term-tab ${isDesktop ? "" : "term-tab-flat"} group relative px-1.5 sm:px-2.5 text-xs font-medium flex items-center gap-1 sm:gap-2 whitespace-nowrap h-full cursor-pointer select-none touch-manipulation`}
               data-tip={`${tab.title || "Agent tab"} (${tab.profile})`}
             >
               <div className="w-3.5 h-3.5 flex items-center justify-center shrink-0">
@@ -760,21 +759,15 @@ function TerminalHeader({
         </button>
       )}
 
-      {/* Settings lives at the bottom of the sidebar on desktop; kept here for mobile */}
-      <button
-        onClick={() => { vibrate(); openMenu(); }}
-        className={`p-1.5 text-text hover:bg-surface-2 hover:text-text rounded-brand transition duration-150 ease-out active:scale-[0.94] ${onToggleSidebar ? "sm:hidden" : ""}`}
-        title={t("menu.title")}
-      >
-        <Settings size={16} />
-      </button>
+      {/* Settings lives at the bottom of the sidebar on desktop and in the dock's
+          menu tab on a phone — the header no longer carries a copy. */}
       </div>
 
       {/* Browser tab right-click context menu */}
       {browserTabMenu.targetId && (
         <div
           ref={browserTabMenuRef}
-          className="fixed z-[60] menu-popover p-1 min-w-[150px] animate-in fade-in zoom-in-95 duration-100"
+          className="fixed z-[60] menu-popover p-1 min-w-[150px] pop-in"
           style={{ left: browserTabMenuPos.left, top: browserTabMenuPos.top }}
         >
           <button
@@ -814,7 +807,7 @@ function TerminalHeader({
       {tabMenu.sessionId && (
         <div
           ref={tabMenuRef}
-          className="fixed z-[60] menu-popover p-1 min-w-[140px] animate-in fade-in zoom-in-95 duration-100"
+          className="fixed z-[60] menu-popover p-1 min-w-[140px] pop-in"
           style={{ left: tabMenuPos.left, top: tabMenuPos.top }}
         >
           {/* Only a yellow terminal has something to mark read; typing/giving it a prompt

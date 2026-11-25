@@ -214,7 +214,7 @@ export default function BrowserPane({ busRef, connected = false, visible = true,
         profile,
         width: Math.round(viewportPreset?.width || rect?.width || 720),
         height: Math.round(viewportPreset?.height || rect?.height || 1280),
-        mobile: !!viewportPreset?.mobile,
+        mobile: !!viewportPreset?.mobile || (isMobile && !viewportPreset),
         scale: boost.scale,
         quality: qualityRef.current || boost.quality
       };
@@ -240,7 +240,7 @@ export default function BrowserPane({ busRef, connected = false, visible = true,
       const toStop = streamedTargetIdRef.current || currentStartedId || watchedId;
       bus.emit("browser:stream.stop", { targetId: toStop });
     };
-  }, [busRef, connected, visible, watchedId, restartTick, viewportPreset, profile, isLocal, setActive, wsKey, popupTab?.id]);
+  }, [busRef, connected, visible, watchedId, restartTick, viewportPreset, profile, isMobile, isLocal, setActive, wsKey, popupTab?.id]);
 
   // Re-show after display:none: the flip fires no resize event and a hidden
   // resize was ignored, so re-apply the canvas fit here or scale(0) blanks the stage.
@@ -470,10 +470,54 @@ export default function BrowserPane({ busRef, connected = false, visible = true,
     setCtxMenu({ x: at.x, y: at.y, element: res?.ok ? res.element : null });
   };
 
+  // Natural mobile touch (auto-fit): forward raw touches to the page — Chrome
+  // under mobile emulation synthesizes taps, scrolling, momentum and pinch-zoom
+  // itself, exactly like a real device. The remote-desktop gesture layer (canvas
+  // zoom + wheel synthesis) never sees these events.
+  const naturalPtsRef = useRef(null);
+  const lastNaturalTouchAtRef = useRef(0);
+  const pagePoints = (pts) => [...pts.values()].map((p) => pagePoint(p.x, p.y));
+  const handleNaturalTouch = (e, type) => {
+    // Claimed only — the page's own menus/zoom must not be double-fired by the
+    // client-side dblclick/contextmenu handlers.
+    if (type === "dblclick" || type === "contextmenu") return;
+    if (!frameRef.current || !e.changedTouches) return;
+    lastNaturalTouchAtRef.current = Date.now();
+    const pts = naturalPtsRef.current || (naturalPtsRef.current = new Map());
+    if (type === "touch") {
+      for (const t of e.changedTouches) pts.set(t.identifier, { x: t.clientX, y: t.clientY });
+      if (pts.size) emits.emitTouch("start", pagePoints(pts));
+      return;
+    }
+    if (type === "touchmove") {
+      for (const t of e.changedTouches) {
+        const p = pts.get(t.identifier);
+        if (p) { p.x = t.clientX; p.y = t.clientY; }
+      }
+      if (pts.size) emits.emitTouch("move", pagePoints(pts));
+      return;
+    }
+    // touchend — the last finger ends the gesture; an earlier lift re-points the rest
+    for (const t of e.changedTouches) pts.delete(t.identifier);
+    emits.emitTouch(pts.size ? "move" : "end", pts.size ? pagePoints(pts) : []);
+  };
+
   // Pick / annotate modes claim the canvas pointer events (pick = tap one, drag = sweep);
   // otherwise nothing is intercepted and the remote-desktop input pipeline drives the page.
   const interceptPointer = (e, type) => {
     if (!grabIntent) return false;
+    // Natural mobile auto-fit: claim touch and its pointer/dblclick/contextmenu
+    // shadows so the remote-desktop layer never double-fires over the forwarded
+    // touches. dblclick/contextmenu only right after a real touch — a mouse on a
+    // narrow window keeps its own handlers.
+    if (isMobile && !viewportPreset && (
+      type.startsWith("touch")
+      || ((type === "pointerdown" || type === "pointermove" || type === "pointerup") && e.pointerType === "touch")
+      || ((type === "dblclick" || type === "contextmenu") && Date.now() - lastNaturalTouchAtRef.current < 600)
+    )) {
+      handleNaturalTouch(e, type);
+      return true;
+    }
     if (type === "wheel" || type === "contextmenu") return false;
     if (type.startsWith("touch") || type === "dblclick" || e.button > 2) return true;
     if (type === "pointerdown") {
@@ -762,7 +806,7 @@ export default function BrowserPane({ busRef, connected = false, visible = true,
         {vpMenu && (
           <>
             <div className="fixed inset-0 z-10" onClick={() => setVpMenu(false)} />
-            <div className={`absolute z-20 flex flex-col p-1 rounded-xl card-elev animate-in fade-in duration-100 min-w-[170px] ${float ? "bottom-12 left-0" : "top-10 right-0"}`}>
+            <div className={`absolute z-20 flex flex-col p-1 menu-popover pop-in min-w-[170px] ${float ? "bottom-12 left-0" : "top-10 right-0"}`}>
               {VIEWPORT_PRESETS.map((opt) => (
                 <button
                   key={opt.label}
@@ -779,7 +823,7 @@ export default function BrowserPane({ busRef, connected = false, visible = true,
                     (opt.w ? viewportPreset?.width === opt.w : !viewportPreset) ? "bg-surface-3 text-text font-medium" : "text-text-muted hover:bg-surface-2 hover:text-text"
                   }`}
                 >
-                  {opt.label}
+                  {opt.w ? opt.label : (isMobile ? "Natural (fit)" : opt.label)}
                 </button>
               ))}
             </div>
@@ -791,7 +835,7 @@ export default function BrowserPane({ busRef, connected = false, visible = true,
   };
 
   return (
-    <div className="absolute inset-0 z-20 flex flex-col bg-surface text-text transition-all duration-300 ease-out animate-in slide-in-from-bottom">
+    <div className="absolute inset-0 z-20 flex flex-col bg-surface text-text transition-all duration-300 ease-out sheet-rise">
       {/* Toolbar — orca BrowserPane layout: nav · address · tools · ⋯.
           Tabs live in the terminal header strip (orca's unified tabs). */}
       <div className="shrink-0 relative z-30 flex items-center gap-1 md:gap-2 border-b border-border-subtle bg-surface/95 px-2 md:px-3 py-1.5">

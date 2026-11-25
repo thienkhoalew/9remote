@@ -191,6 +191,37 @@ await test("a recorded event carries its log seq to the client", () => {
   assert.equal(session.history.at(-1).seq, seqs.at(-1));
 });
 
+// Without the epoch a renumbered log's echo reads as "already applied" on the client and
+// the prompt the user just sent vanishes; it must survive the AiManager hop.
+await test("a live event carries its log epoch through the manager", () => {
+  const socket = new MockSocket();
+  const bus = new MockBus();
+  const manager = new AiManager();
+  setupAiHandlers(socket, bus, manager);
+  const session = manager.createSession("epoch-s1", AI_ENGINES.CLAUDE, "/tmp", { mock: true });
+
+  session.emitNormalized("delta", { text: "one" });
+  assert.equal(socket.emitted.at(-1).data.epoch, session.logEpoch);
+  assert.ok(session.logEpoch != null);
+});
+
+// A Resend after a lost ack carries the same promptId; the host already ran it once.
+await test("a repeated promptId is acked but not run twice", async () => {
+  const socket = new MockSocket();
+  const bus = new MockBus();
+  const manager = new AiManager();
+  setupAiHandlers(socket, bus, manager);
+  manager.createSession("dedupe-s1", AI_ENGINES.CLAUDE, "/tmp", { mock: true });
+
+  const first = await socket.trigger("ai:prompt", { sessionId: "dedupe-s1", message: "hi", promptId: "p-1" });
+  const again = await socket.trigger("ai:prompt", { sessionId: "dedupe-s1", message: "hi", promptId: "p-1" });
+  const echoes = socket.emitted.filter((e) => e.data?.event === "user_message");
+  assert.equal(first?.ok, true);
+  assert.equal(again?.ok, true);
+  assert.equal(again?.repeat, true);
+  assert.equal(echoes.length, 1, "the turn ran once");
+});
+
 // An unrecorded event is not in the log the client's watermark is compared against —
 // stamping it would leave the watermark past the snapshot, and the next hydrate would
 // swallow every event up to that number.
@@ -203,6 +234,115 @@ await test("an event kept out of the log carries no seq", () => {
 
   session.emitNormalized("init", { model: "m" }, false);
   assert.equal(socket.emitted.at(-1).data.seq, undefined);
+});
+
+// A manager stub hands the test the event listener the socket layer installs, so a
+// late CLI failure can be replayed exactly as the real adapter emits it.
+function stubManager(session) {
+  const listeners = [];
+  return {
+    listeners,
+    onEvent(fn) { listeners.push(fn); return () => {}; },
+    getSession: () => session,
+    createSession: () => session
+  };
+}
+
+await test("a repeat whose prompt never ran is accepted again", async () => {
+  // The adapter refused before any user_message existed (dead CLI, write rejected).
+  // The id was recorded, so a Resend used to be acked "repeat" and ignored forever.
+  const socket = new MockSocket();
+  const manager = stubManager(null);
+  const calls = [];
+  const session = {
+    history: [],
+    isTurnRunning: false,
+    ensureProcAlive: async () => {},
+    sendPrompt: (text, attachments, promptId) => {
+      calls.push(text);
+      if (calls.length > 1) return; // the resend reaches a recovered CLI
+      for (const l of manager.listeners) l("refuse-s1", "prompt_refused", { text, promptId, reason: "not writable" }, undefined, "e1");
+      return { refused: true, error: "not writable" };
+    }
+  };
+  manager.getSession = () => session;
+  setupAiHandlers(socket, new MockBus(), manager);
+
+  const first = await socket.trigger("ai:prompt", { sessionId: "refuse-s1", message: "hi", promptId: "p-refuse" });
+  const again = await socket.trigger("ai:prompt", { sessionId: "refuse-s1", message: "hi", promptId: "p-refuse" });
+
+  assert.equal(first?.ok, false, "a prompt no turn accepted must not ack ok");
+  assert.match(first?.error, /not writable/);
+  assert.equal(again?.ok, true);
+  assert.equal(again?.repeat, undefined, "a prompt that never ran must not be acked as a repeat");
+  assert.equal(calls.length, 2, "the resend reaches the adapter again");
+});
+
+await test("a repeat whose late write failure was reported is accepted again", async () => {
+  // Daemon write failures arrive after the ack: the adapter emits an error carrying
+  // the promptId. The id must be released, or the user's Resend is silently dropped.
+  const socket = new MockSocket();
+  const manager = stubManager(null);
+  const calls = [];
+  const session = {
+    history: [],
+    isTurnRunning: false,
+    ensureProcAlive: async () => {},
+    sendPrompt: (text) => { calls.push(text); }
+  };
+  manager.getSession = () => session;
+  setupAiHandlers(socket, new MockBus(), manager);
+
+  await socket.trigger("ai:prompt", { sessionId: "refuse-s2", message: "hi", promptId: "p-late" });
+  for (const l of manager.listeners) {
+    l("refuse-s2", "error", { message: "The CLI did not accept the prompt", promptId: "p-late" }, undefined, "e2");
+  }
+  const again = await socket.trigger("ai:prompt", { sessionId: "refuse-s2", message: "hi", promptId: "p-late" });
+
+  assert.equal(again?.repeat, undefined);
+  assert.equal(calls.length, 2);
+});
+
+await test("a repeat after the turn ran is still acked without running twice", async () => {
+  const socket = new MockSocket();
+  const manager = stubManager(null);
+  const calls = [];
+  const session = {
+    history: [{ event: "user_message", data: { text: "hi" } }],
+    isTurnRunning: false,
+    ensureProcAlive: async () => {},
+    sendPrompt: (text) => { calls.push(text); }
+  };
+  manager.getSession = () => session;
+  setupAiHandlers(socket, new MockBus(), manager);
+
+  await socket.trigger("ai:prompt", { sessionId: "ran-s1", message: "hi", promptId: "p-ran" });
+  const again = await socket.trigger("ai:prompt", { sessionId: "ran-s1", message: "hi", promptId: "p-ran" });
+
+  assert.equal(again?.repeat, true);
+  assert.equal(calls.length, 1);
+});
+
+await test("a repeat while the first prompt is queued mid-turn is not run twice", async () => {
+  // Still in flight (CLI booting or turn running): no user_message yet, but running
+  // must win — re-running here would answer the same prompt twice.
+  const socket = new MockSocket();
+  const manager = stubManager(null);
+  const calls = [];
+  const session = {
+    history: [],
+    isTurnRunning: false,
+    ensureProcAlive: async () => {},
+    sendPrompt: (text) => { calls.push(text); session.isTurnRunning = true; }
+  };
+  manager.getSession = () => session;
+  setupAiHandlers(socket, new MockBus(), manager);
+
+  await socket.trigger("ai:prompt", { sessionId: "run-s1", message: "hi", promptId: "p-run" });
+  const again = await socket.trigger("ai:prompt", { sessionId: "run-s1", message: "hi", promptId: "p-run" });
+
+  assert.equal(again?.repeat, true);
+  assert.equal(calls.length, 1);
 });
 
 if (fail > 0) {

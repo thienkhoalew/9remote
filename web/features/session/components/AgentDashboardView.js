@@ -4,6 +4,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import ConfirmDialog from "@/shared/components/ui/ConfirmDialog";
 import PromptDialog from "@/shared/components/ui/PromptDialog";
 import { isHostEnvironment } from "@/shared/utils/localOrigin";
+import { openExternal } from "@/shared/utils/openExternal";
+import { reloadWhenHostReady } from "@/shared/utils/hostReady";
 import { HOMEPAGE_URL } from "@/shared/constants/API";
 import { usePendingDeviceStore } from "@/features/session/stores/pendingDeviceStore";
 import { APP_STORE_URL, PLAY_STORE_URL } from "@/features/landing/constants/landingConfig";
@@ -193,9 +195,10 @@ function UpdateBanner({ version, isUpdating = false }) {
       poll = setInterval(async () => {
         if (Date.now() - startedAt > UPDATE_UI.timeoutMs) { setPhase("timeout"); clearInterval(poll); return; }
         try {
-          const res = await fetch("/api/ui/state", { cache: "no-store" });
+          // The gate answers 200 HTML on /api/ui/state — only health proves the host is back.
+          const res = await fetch("/api/health", { cache: "no-store" });
           if (!res.ok) throw new Error();
-          if (diedOnce) { setPhase("ready"); clearInterval(poll); setTimeout(() => window.location.reload(), 600); }
+          if (diedOnce) { setPhase("ready"); clearInterval(poll); setTimeout(() => reloadWhenHostReady(), 600); }
         } catch {
           diedOnce = true;
           setPhase("restarting");
@@ -242,7 +245,7 @@ function UpdateBanner({ version, isUpdating = false }) {
         </>
       )}
       {phase === "timeout" && (
-        <button onClick={() => window.location.reload()} className="flex-shrink-0 text-xs px-2 py-0.5 rounded font-medium" style={{ background: "rgba(var(--brand-rgb),0.15)", color: "var(--brand-400)" }}>Reload</button>
+        <button onClick={() => reloadWhenHostReady()} className="flex-shrink-0 text-xs px-2 py-0.5 rounded font-medium" style={{ background: "rgba(var(--brand-rgb),0.15)", color: "var(--brand-400)" }}>Reload</button>
       )}
     </div>
   );
@@ -529,15 +532,6 @@ function DashboardQrCard({ qrUrl, oneTimeKey, oneTimeKeyExpiresAt, permanentKey,
 
 // One connect card = tile + title/sub + arrow, the whole card is the link.
 // hero-card supplies the glass + mirror sheen. icon: Material Symbols name or ReactNode.
-// In Tauri, target=_blank opens another webview window (looks like the app
-// again) — hand external links to the system browser via the opener plugin.
-function openExternal(e, href) {
-  const opener = window.__TAURI__?.opener;
-  if (!opener?.openUrl) return; // plain browser: let the <a> do its job
-  e.preventDefault();
-  opener.openUrl(href).catch(() => {});
-}
-
 function ConnectCard({ icon, iconClass, title, sub, href }) {
   return (
     <a href={href} target="_blank" rel="noopener noreferrer" onClick={(e) => openExternal(e, href)} className="hero-card ad-connect-card">
@@ -618,7 +612,7 @@ export default function AgentDashboardView() {
       .then((d) => {
         const v = d.version ?? "";
         if (!v) return;
-        if (versionRef.current && versionRef.current !== v) { window.location.reload(); return; }
+        if (versionRef.current && versionRef.current !== v) { reloadWhenHostReady(); return; }
         versionRef.current = v;
       })
       .catch(() => {});

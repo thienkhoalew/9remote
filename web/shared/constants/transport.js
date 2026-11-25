@@ -194,6 +194,40 @@ export const WS_ZOMBIE_MS = 30000;
 // progressing upload keeps draining, so it never trips).
 export const WS_OUTBOUND_STALL_MS = 15000;
 
+// Ack-timeout control carry — a request whose ack never arrives proves the
+// carrier's write path is dead even when its inbound keeps flowing. Control
+// moves onto the WS tunnel while RTC is rebuilt; an RTC reopen ends the carry.
+export const WS_CONTROL_CARRY_MS = 60000;
+
+// Carrier RTT probe — client-initiated round-trip on the carrier's own write
+// path. The host heartbeat only proves inbound, so an idle or half-dead peer
+// stays invisible until a request happens to fail. Gated by srvCaps.rttCtl.
+export const RTT_PROBE = {
+  intervalMs: 4000,
+  timeoutMs: 2000,
+  missesBeforeFailover: 2
+};
+
+// Sequenced control stream — every control envelope carries {sq, ep, rs}; each
+// PM keeps a byte-capped replay ring (outbound) and a one-door sequencer
+// (inbound: dedupe, order, NACK gap repair). Kills the cross-carrier
+// reorder/duplicate/loss races and the ack false-negative on RTC death.
+// Mirrored in host/lib/transportConstants.js.
+// Host's answer to a request its admission gate refused (mirror of host connectionConstants).
+export const NOT_ADMITTED = "not-admitted";
+
+export const SEQ_CTL = {
+  // A request refused as not-admitted is held and re-sent after re-admission, this many times.
+  admitRetryMax: 2,
+  // Min gap between two admission repairs (carrier re-dial) for one PM.
+  admitKickMinMs: 3000,
+  ringMaxBytes: 4 * 1024 * 1024,
+  maxEntries: 2000,
+  holdMax: 256,
+  gapDeadlineMs: 3000,
+  ackMaxLives: 3
+};
+
 // File-transfer tunables (DC "file", separate from tiles' dcBinary).
 // chunkSize + 8-byte frame header must fit dcMaxMessageSize (SCTP hard limit).
 // dcBufferThreshold is generous (8MB) — file transfer is throughput, not real-time.

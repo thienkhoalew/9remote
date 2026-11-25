@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { createPortal } from "react-dom";
 import { Mic, X, ExternalLink } from "@/shared/components/ui/Icon";
 import { vibrate } from "@/shared/utils/vibration";
 import { useI18n } from "@/shared/i18n";
@@ -260,10 +261,13 @@ export function VoiceConfigForm() {
 
 // Modal chrome around the form — launched from the drawer/menu row.
 function VoiceConfigModal({ onClose }) {
-  return (
-    <div className="fixed inset-0 z-[60] flex items-center justify-center p-4">
-      <div className="absolute inset-0 bg-black/60 backdrop-blur-[2px] animate-in fade-in duration-200" onClick={onClose} />
-      <div className="relative card-elev max-w-md w-full max-h-[90dvh] flex flex-col animate-in zoom-in-95 duration-200">
+  if (typeof document === "undefined") return null;
+  // Portaled: the drawer panel keeps `transform` from its slide-in animation, which
+  // would trap a fixed overlay inside the panel instead of the viewport.
+  return createPortal(
+    <div className="modal-overlay z-[60]">
+      <div className="absolute inset-0 scrim fade-in" onClick={onClose} />
+      <div className="relative card-elev max-w-md w-full my-auto flex flex-col pop-in">
         <div className="px-5 py-4 flex items-center justify-between flex-shrink-0">
           <h3 className="text-lg font-semibold text-text">Voice input</h3>
           <button
@@ -274,11 +278,12 @@ function VoiceConfigModal({ onClose }) {
             <X size={20} />
           </button>
         </div>
-        <div className="flex-1 overflow-y-auto modal-scrollable px-5 pb-5 min-h-[320px]">
+        <div className="flex-1 min-h-0 overflow-y-auto modal-scrollable px-5 pb-5">
           <VoiceConfigForm />
         </div>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }
 
@@ -298,16 +303,18 @@ export default function VoiceEndpointSettings({ dense = false }) {
   };
 
   const rowCls = dense
-    ? "w-full py-1 text-sm text-text flex items-center gap-2.5 cursor-pointer select-none"
+    ? "w-full px-3.5 py-2 text-text flex items-center gap-3 cursor-pointer select-none transition-colors duration-150 ease-out active:bg-text/[0.06]"
     : "w-full px-3 py-2 rounded-brand flex items-center gap-2.5 text-sm text-text hover:bg-surface-2 cursor-pointer select-none transition-colors";
 
   return (
     <>
       <div className={rowCls} onClick={handleOpen}>
-        <Mic size={16} className={`${dense ? "text-text" : "text-brand-500 dark:text-white"} flex-shrink-0`} />
+        <span className={`w-7 flex-shrink-0 flex items-center justify-center ${dense ? "text-text-muted" : "text-brand-500 dark:text-white"}`}>
+          <Mic size={16} strokeWidth={2.2} />
+        </span>
         <div className="flex-1 min-w-0 flex flex-col">
-          <span className="truncate">Voice input</span>
-          <span className="text-xs text-text-muted truncate">{engine}</span>
+          <span className={`truncate ${dense ? "text-[15px] font-medium" : ""}`}>Voice input</span>
+          <span className="text-[12px] leading-snug text-text-muted truncate">{engine}</span>
         </div>
         <button
           type="button"
@@ -322,9 +329,9 @@ export default function VoiceEndpointSettings({ dense = false }) {
           type="button"
           onClick={(e) => { e.stopPropagation(); vibrate(); setEnabled(!enabled); }}
           aria-label="Toggle voice input"
-          className={`shrink-0 relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${enabled ? "bg-brand-500" : "bg-surface-2"}`}
+          className={`shrink-0 relative inline-flex items-center rounded-full transition-colors duration-200 ${dense ? "h-6 w-11" : "h-5 w-9"} ${enabled ? (dense ? "bg-[#34c759]" : "bg-brand-500") : dense ? "bg-text/15" : "bg-surface-2"}`}
         >
-          <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${enabled ? "translate-x-4" : "translate-x-0.5"}`} />
+          <span className={`inline-block transform rounded-full bg-white shadow-sm transition-transform duration-200 ease-out ${dense ? (enabled ? "h-5 w-5 translate-x-[22px]" : "h-5 w-5 translate-x-0.5") : (enabled ? "h-4 w-4 translate-x-4" : "h-4 w-4 translate-x-0.5")}`} />
         </button>
       </div>
       {open && <VoiceConfigModal onClose={() => setOpen(false)} />}

@@ -14,11 +14,17 @@ import { upsertTask } from "../lib/taskList";
 import { estimateMessageBytes } from "../lib/messageWindow";
 import { collectOlderPage } from "../lib/olderPaging";
 import { createRetryLadder, shouldApplyHydrateAck } from "../lib/hydrateRetry";
-import { classifyLiveEvent, fetchedIsSafe } from "../lib/gapFill";
+import { classifyLiveEvent, fetchedIsSafe, splitByHole } from "../lib/gapFill";
+import { createSingleLane } from "../lib/singleLane";
+import { AI_CACHE_MAX_BYTES, appendTail, buildCacheEntry, cacheKey, shouldUseCachedSnapshot, trimTail } from "../lib/aiCache";
+import { aiCacheEnabled, readAiCache, writeAiCache } from "../lib/aiCacheStore";
 import { termLog } from "@/shared/utils/termLog";
-import { RECOVER_DEBOUNCE_MS, PEEK_TIMEOUT_MS } from "@/features/terminal/constants/terminalConfig";
-import { RESOLVE_ACK_TIMEOUT_MS, PROMPT_ACK_TIMEOUT_MS } from "../constants";
+import { PEEK_TIMEOUT_MS } from "@/features/terminal/constants/terminalConfig";
+import { RESOLVE_ACK_TIMEOUT_MS, PROMPT_ACK_TIMEOUT_MS, PROMPT_ECHO_TIMEOUT_MS } from "../constants";
 import { emitPromptAck } from "../lib/promptAck";
+import { createEchoWatchdog } from "../lib/echoWatchdog";
+import { rememberPrompt } from "../lib/promptHistory";
+import { addPending, removePending, removePendingByText, takeOrphans } from "../lib/pendingPrompts";
 
 // CLI reports skills as bare id strings, the agent scan as objects; normalize to one shape.
 const normalizeSkills = (skills) =>
@@ -39,6 +45,12 @@ const SILENCE_PEEK_MAX_MS = 120_000;
 const GAP_CONFIRM_MS = 1500;
 // Events held while a hole is fetched; past this the pane resyncs whole instead.
 const MAX_GAP_HELD = 200;
+// A finished turn settles before its tail is written — a turn that keeps going writes nothing.
+const CACHE_WRITE_DEBOUNCE_MS = 800;
+// Automatic resends after a reconnect — past this the manual bar is the only road.
+const PROMPT_AUTO_RETRY_MAX = 2;
+// This page life — a pending prompt stamped with it is in flight here, not an orphan.
+const PAGE_ID = Math.random().toString(36).slice(2, 10);
 
 // The CLI reports some failures twice (streamed prose + `result`); only the last message is checked to stay cheap.
 function alreadySaid(messages, text) {
@@ -46,6 +58,14 @@ function alreadySaid(messages, text) {
   if (!said) return false;
   const last = messages[messages.length - 1];
   return Boolean(last && last.role === "assistant" && String(last.content || "").trim().endsWith(said));
+}
+
+// The turn settled on an assistant row with nothing in it: the pane missed the whole
+// answer, and only the host's log can put it back.
+function emptyAnswerRow(messages) {
+  const last = messages?.[messages.length - 1];
+  if (!last || last.role !== "assistant") return false;
+  return !last.content && !last.thinking && !(last.tools?.length) && !(last.diffs?.length);
 }
 
 // Escape codes a raw CLI line carries — the row shows the text between them, not the codes.
@@ -392,6 +412,45 @@ export function reduceSessionEvents(events = [], engine = "claude", idBase = 0) 
   };
 }
 
+// The echo lands in the store before the ack's own window closes, so a timeout that
+// fires afterwards is not evidence of loss. Without this check the late "lost" entry
+// was never cleared by anything (its echo had already gone by) and every reconnect
+// auto-resent it as a NEW turn — the same words, over and over.
+function promptAlreadyShown(sid, text) {
+  if (!text) return false;
+  const messages = useAiStore.getState().bySession[sid]?.messages || [];
+  // Only the NEWEST user bubble counts: an older identical prompt is not evidence —
+  // "tiếp" is asked again all the time, and a genuinely lost one must stay recoverable.
+  const lastUser = [...messages].reverse().find((m) => m.role === "user");
+  if (!lastUser) return false;
+  // A merged loss appends, so the newest echo is the tail of the blob.
+  return lastUser.content === text || String(text).endsWith("\n\n" + lastUser.content);
+}
+
+// A reload between send and ack: offer back what the replayed log does not show as delivered.
+function surfaceOrphanPrompts(sid, events) {
+  const deliveredTexts = (events || []).filter((e) => e.event === "user_message").map((e) => e.data?.text);
+  const orphans = takeOrphans(sid, { deliveredTexts, page: PAGE_ID, minAgeMs: PROMPT_ACK_TIMEOUT_MS })
+    .filter((p) => !promptAlreadyShown(sid, p.text));
+  for (const p of orphans) useAiStore.getState().setPromptError(sid, p.text, "reload", null, p.id);
+}
+
+// The host echoed a prompt the composer reported lost — drop that part, keep any other.
+// The match may sit anywhere in the merged text: a middle segment left behind kept the
+// whole blob "lost" forever, and the next reconnect sent it again.
+function clearEchoedPromptError(sid, echoed) {
+  const lost = useAiStore.getState().bySession[sid]?.promptError;
+  if (!lost || !echoed) return;
+  if (lost.text === echoed) { useAiStore.getState().clearPromptError(sid); return; }
+  const parts = lost.text.split("\n\n");
+  const at = parts.indexOf(echoed);
+  if (at === -1) return;
+  parts.splice(at, 1);
+  const rest = parts.filter(Boolean).join("\n\n");
+  if (rest) useAiStore.getState().setPromptErrorText(sid, rest);
+  else useAiStore.getState().clearPromptError(sid);
+}
+
 export function useAiSession({
   sessionId,
   engine = "claude",
@@ -433,6 +492,18 @@ export function useAiSession({
   const [hydrateFailed, setHydrateFailed] = useState(false);
   const olderSeqRef = useRef(0);
   const loadingOlderRef = useRef(false);
+  // Echo watchdogs keyed by prompt id — an acked prompt with no user_message back
+  // must surface as resendable instead of leaving the chat blank.
+  const echoWatchRef = useRef(new Map());
+  const settleEchoWatch = useCallback((text) => {
+    const map = echoWatchRef.current;
+    if (!map.size) return;
+    for (const [id, entry] of map) {
+      if (entry.text !== text) continue;
+      entry.watch.settle();
+      map.delete(id);
+    }
+  }, []);
 
   // Dispatch-only by design: subscribing here would rebuild the hook per streamed frame.
 
@@ -442,10 +513,13 @@ export function useAiSession({
       case "user_message":
         // `replay` marks a re-sent log: the prompt already happened, so it opens no turn.
         addUserMessage(sid, data.text, data.attachments || null, Boolean(data?.replay));
-        // Echo of a prompt the composer reported lost — the host did get it.
-        if (useAiStore.getState().bySession[sid]?.promptError?.text === data.text) {
-          useAiStore.getState().clearPromptError(sid);
+        if (!data?.replay) {
+          removePendingByText(sid, data.text);
+          useAiStore.getState().clearPromptSending(sid, data.text);
         }
+        // Echo of a prompt the composer reported lost — the host did get it.
+        clearEchoedPromptError(sid, data.text);
+        settleEchoWatch(data?.text);
         break;
       case "init": {
         // Keep persisted descriptions when the CLI's bare ids arrive second.
@@ -529,6 +603,13 @@ export function useAiSession({
       // The host's span is the honest number for a client that joined mid-turn.
       case "turn_complete":
         finishTurn(sid, data.stats, data.turnMs, Boolean(data?.replay));
+        // A settled turn that leaves an empty answer row is the pane having missed the
+        // whole stream (a dropped carrier, a window that opened past it): the log is at
+        // the host, so pull it once instead of waiting for the next prompt to heal it.
+        if (!data?.replay && emptyAnswerRow(useAiStore.getState().bySession[sid]?.messages)) {
+          termLog("ai-hydrate", "settled with an empty answer → hydrate", { sessionId: sid });
+          laneRef.current?.request("hydrate");
+        }
         // A failed turn draws the CLI's own sentence, rebuilt on replay too; alreadySaid guards the double report.
         if (data?.isError && !failureAlreadyDrew(useAiStore.getState().bySession[sid]?.messages, data.result) && !alreadySaid(useAiStore.getState().bySession[sid]?.messages, data.result)) {
           useAiStore.getState().addNotice(sid, {
@@ -610,7 +691,7 @@ export function useAiSession({
       default:
         break;
     }
-  }, [engine, addUserMessage, setMetadata, appendDelta, appendThinking, appendDiff, appendTool, updateToolResult, nestTool, nestToolResult, upsertTask, setPermission, clearPermission, finishTurn, setTurnRunning, ensureTurnLive]);
+  }, [engine, addUserMessage, setMetadata, appendDelta, appendThinking, appendDiff, appendTool, updateToolResult, nestTool, nestToolResult, upsertTask, setPermission, clearPermission, finishTurn, setTurnRunning, ensureTurnLive, settleEchoWatch]);
 
   // Ref, not dep: the hydrate effect must not re-emit ai:create over a mid-stream session.
   const applyEventRef = useRef(applyEvent);
@@ -630,14 +711,23 @@ export function useAiSession({
   const pendingLiveRef = useRef([]);
   // Bumped per attempt; a stale StrictMode ack must not release a newer cycle's gate.
   const hydrateSeqRef = useRef(0);
-  // Re-ask ladder; delays live in lib/hydrateRetry, this drives its timer.
+  // Re-ask ladder; delays live in lib/hydrateRetry — the delay is handed to the lane.
   const ladderRef = useRef(null);
   if (ladderRef.current == null) ladderRef.current = createRetryLadder();
-  const retryTimerRef = useRef(null);
-  const hydrateDebounceRef = useRef(null);
+  const lastHydrateOkAtRef = useRef(0);
   const releaseTimerRef = useRef(null);
-  // The ladder's timer fires outside render — it reaches the door through this ref.
-  const doorRef = useRef({});
+  // One lane for every recovery ask (probe / gap fill / hydrate): one debounce, one
+  // in-flight round, one coalesced pending intent. The law lives in lib/singleLane.
+  const laneRef = useRef(null);
+  // Runners reached through refs so the lane never holds a stale closure.
+  const hydrateNowRef = useRef(null);
+  const runProbeRef = useRef(null);
+  // The gap runner lives inside the events effect (it needs applyLive's stream buffer).
+  const gapRunnerRef = useRef(null);
+  const gapTimerRef = useRef(null);
+  // Auto-resend reaches back into sendPrompt, which is defined below the effects.
+  // Auto-resend reaches back into sendPrompt, which is defined below the effects.
+  const autoResendRef = useRef(null);
   // Session that last owned the gate; a late workspacePath re-run must not reopen it.
   const gateSessionRef = useRef(null);
 
@@ -647,12 +737,15 @@ export function useAiSession({
   }, [isVisible]);
 
   const pendingRecoverRef = useRef(null);
-  const peekDebounceRef = useRef(null);
   const peekDeadlineRef = useRef(null);
 
-  // Gap-fill: events held while the missing range is fetched, and that fetch's busy flag.
+  // Gap-fill: events held while the missing range is fetched.
   const gapHeldRef = useRef([]);
-  const gapBusyRef = useRef(false);
+  // Best-effort replay tail kept in IndexedDB (lib/aiCache). Never authoritative:
+  // it only paints while the host hydrate is on its way, and is replaced by its ack.
+  const tailRef = useRef({ events: [], bytes: 0, hasMore: false });
+  const cacheWriteTimerRef = useRef(null);
+  const cacheLoadSessionRef = useRef(null);
   // Silence probe: last inbound ai:event, the silence threshold (backs off while quiet),
   // its in-flight flag, consecutive misses, and when the user last sent a prompt.
   const lastEventAtRef = useRef(0);
@@ -662,36 +755,143 @@ export function useAiSession({
   const promptSentAtRef = useRef(0);
 
   const clearHydrateRetry = useCallback(() => {
-    if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
-    retryTimerRef.current = null;
     ladderRef.current?.answered();
+    // Only the rung: a gap ask that arrived meanwhile is a different piece of work.
+    laneRef.current?.clearPending("hydrate");
   }, []);
 
-  // One door: a request landing mid-round arms a ladder rung instead of stacking rounds.
+  // A failed round hands the ladder's delay to the lane — one timer, no stacked rounds.
   const scheduleHydrateRetry = useCallback(() => {
     const delay = ladderRef.current?.schedule(useConnectionStore.getState().connected);
-    // A null delay means offline or a timer already armed — neither is a failure.
+    // A null delay means offline or a rung already armed — neither is a failure.
     setHydrateFailed(Boolean(ladderRef.current?.exhausted()));
     termLog("ai-hydrate", "ladder", {
       delay: delay ?? null, exhausted: ladderRef.current?.exhausted(),
-      connected: useConnectionStore.getState().connected, armed: retryTimerRef.current != null
+      connected: useConnectionStore.getState().connected
     });
-    if (delay == null) return;
-    retryTimerRef.current = setTimeout(() => {
-      retryTimerRef.current = null;
-      ladderRef.current?.fired();
-      // Through the door: two rounds in flight is what the gate forbids.
-      doorRef.current.request?.();
-    }, delay);
+    if (delay != null) laneRef.current?.request("hydrate", { delayMs: delay });
+  }, []);
+
+  // The lane is built once per mount; every runner is reached through a ref, never a closure.
+  useEffect(() => {
+    laneRef.current = createSingleLane({
+      run: (intent, done) => {
+        // A runner that is not wired yet must still settle, or the lane jams forever.
+        if (intent === "recover") {
+          if (runProbeRef.current) runProbeRef.current(done);
+          else done();
+          return;
+        }
+        if (intent === "gap") {
+          if (gapRunnerRef.current) gapRunnerRef.current(done);
+          else { laneRef.current?.request("hydrate"); done(); }
+          return;
+        }
+        // hydrate | now — the mount path calls hydrateNow directly, so the blocked
+        // branch inside settles the lane and re-arms through the ladder.
+        ladderRef.current?.fired();
+        if (hydrateNowRef.current) hydrateNowRef.current(done);
+        else done();
+      }
+    });
   }, []);
 
   // 1. Pull the host's log: truncate then replay — also the only path back after a carrier drop.
-  const hydrateNow = useCallback(() => {
-    if (!sessionId || !bus) return;
+  // `onSettled` is the lane's done: exactly one call per round, on ack or on release.
+
+  // ── Best-effort replay cache (never authoritative) ───────────────────────────
+
+  // Record what the pane applied so a turn_complete can persist a bounded tail.
+  const noteTail = useCallback((seq, event, data) => {
+    if (event === "conversation_reset") { tailRef.current = { events: [], bytes: 0, hasMore: false }; return; }
+    if (!Number.isInteger(seq)) return;
+    const next = appendTail(tailRef.current, { seq, event, data }, AI_CACHE_MAX_BYTES);
+    tailRef.current = {
+      events: next.events,
+      bytes: next.bytes,
+      hasMore: tailRef.current.hasMore || next.dropped
+    };
+  }, []);
+
+  // A hydrate ack states the log's own tail — it supersedes anything we appended.
+  const setTailFromAck = useCallback((events, hostHasMore) => {
+    const tail = trimTail(events || [], AI_CACHE_MAX_BYTES);
+    tailRef.current = {
+      events: tail.events,
+      bytes: tail.bytes,
+      hasMore: Boolean(hostHasMore) || tail.hasMore
+    };
+  }, []);
+
+  const writeCacheNow = useCallback(() => {
+    if (!aiCacheEnabled() || !sessionId) return;
+    // A running turn would cache half a sentence; the next settled tail supersedes it.
+    if (useAiStore.getState().bySession[sessionId]?.isTurnRunning) return;
+    const hostKey = connForSession(sessionId).head || "";
+    const entry = buildCacheEntry({
+      hostKey,
+      sessionId,
+      epoch: logEpochRef.current,
+      tail: tailRef.current,
+      lastTurnMs: useAiStore.getState().bySession[sessionId]?.lastTurnMs || 0
+    });
+    if (entry) writeAiCache(cacheKey(hostKey, sessionId), entry);
+  }, [sessionId]);
+
+  // A finished turn is a settled tail; a running one would cache half a sentence.
+  const scheduleCacheWrite = useCallback(() => {
+    if (!aiCacheEnabled() || !sessionId) return;
+    if (cacheWriteTimerRef.current) clearTimeout(cacheWriteTimerRef.current);
+    cacheWriteTimerRef.current = setTimeout(() => {
+      cacheWriteTimerRef.current = null;
+      writeCacheNow();
+    }, CACHE_WRITE_DEBOUNCE_MS);
+  }, [sessionId, writeCacheNow]);
+
+  // Paint the cached tail only while the pane is otherwise empty and unanswered.
+  const loadCachedTail = useCallback(() => {
+    if (!aiCacheEnabled() || !sessionId) return;
+    if (cacheLoadSessionRef.current === sessionId) return;
+    cacheLoadSessionRef.current = sessionId;
+    const hostKey = connForSession(sessionId).head || "";
+    readAiCache(cacheKey(hostKey, sessionId)).then((raw) => {
+      // The pane moved to another session while the read was in flight.
+      if (cacheLoadSessionRef.current !== sessionId) return;
+      if (!shouldUseCachedSnapshot(raw, { hostKey, sessionId })) return;
+      // The host answered meanwhile — its replay is the truth, the cache is not needed.
+      if (lastHydrateOkAtRef.current) return;
+      const curr = useAiStore.getState().bySession[sessionId];
+      if (curr?.messages?.length) return;
+      const hydrated = reduceSessionEvents(raw.events, engine);
+      if (!hydrated.messages?.length) return;
+      useAiStore.getState().hydrateSession(sessionId, {
+        messages: hydrated.messages,
+        tasks: hydrated.tasks,
+        metadata: { ...(curr?.metadata || {}), ...hydrated.metadata },
+        stats: hydrated.stats,
+        isTurnRunning: false,
+        elapsedMs: 0,
+        lastTurnMs: raw.lastTurnMs || 0,
+        harnessTasks: hydrated.harnessTasks,
+        queue: []
+      });
+      appliedSeqRef.current = raw.seq;
+      logEpochRef.current = raw.epoch;
+      olderSeqRef.current = raw.firstSeq;
+      setHasOlder(Boolean(raw.hasMore));
+      const tail = trimTail(raw.events, AI_CACHE_MAX_BYTES);
+      tailRef.current = { events: tail.events, bytes: tail.bytes, hasMore: Boolean(raw.hasMore) || tail.hasMore };
+      termLog("ai-cache", "painted cached tail", { sessionId, seq: raw.seq, epoch: raw.epoch, events: raw.events.length });
+    }).catch(() => {});
+  }, [sessionId, engine]);
+
+  const hydrateNow = useCallback((onSettled = null) => {
+    if (!sessionId || !bus) { onSettled?.(); return; }
     // One round at a time; a mid-round request arms the ladder instead.
     if (hydratingRef.current) {
       termLog("ai-hydrate", "blocked (round in flight)", { gen: hydrateSeqRef.current });
       scheduleHydrateRetry();
+      onSettled?.();
       return;
     }
     const gen = ++hydrateSeqRef.current;
@@ -702,7 +902,6 @@ export function useAiSession({
     pendingLiveRef.current = [];
     // A fresh replay supersedes any patch in flight; its events arrive held above.
     gapHeldRef.current = [];
-    gapBusyRef.current = false;
     olderSeqRef.current = 0;
     const sentAt = Date.now();
     termLog("ai-hydrate", "emit ai:create", {
@@ -715,31 +914,37 @@ export function useAiSession({
       pendingLiveRef.current = [];
       hydratingRef.current = false;
       setHydrating(false);
+      // Same law as the live path: a hole is held and fetched, never walked over.
+      const plan = splitByHole(queued, { appliedSeq: appliedSeqRef.current, logEpoch: logEpochRef.current });
+      appliedSeqRef.current = plan.appliedSeq;
+      logEpochRef.current = plan.logEpoch;
       unstable_batchedUpdates(() => {
-        for (const p of queued) {
-          // A reset restarts the log at seq 1 — the snapshot's watermark no longer applies.
+        for (const p of plan.apply) {
+          // The reset's counters are already folded into the plan; only the window rides here.
           if (p.event === "conversation_reset") {
-            appliedSeqRef.current = 0;
-            logEpochRef.current = p.data?.epoch ?? (logEpochRef.current ?? 0) + 1;
             olderSeqRef.current = p.data?.fromSeq ?? 0;
             setHasOlder(Boolean(p.data?.hasMore));
-            applyEventRef.current(sessionId, p.event, p.data);
-            continue;
-          }
-          if (p.seq != null) {
-            if (p.seq <= appliedSeqRef.current) continue;
-            appliedSeqRef.current = p.seq;
           }
           applyEventRef.current(sessionId, p.event, p.data);
+          noteTail(p.seq, p.event, p.data);
         }
       });
+      if (plan.resync) { laneRef.current?.request("hydrate"); return; }
+      if (plan.held.length > MAX_GAP_HELD) { laneRef.current?.request("hydrate"); return; }
+      if (plan.held.length) {
+        gapHeldRef.current = [...gapHeldRef.current, ...plan.held];
+        laneRef.current?.request("gap");
+      }
     };
     // A lost ack must not shut the gate forever; past this window the snapshot is stale.
     const releaseTimer = setTimeout(() => {
       if (gen !== hydrateSeqRef.current || !hydratingRef.current) return;
       releaseHeld();
+      // An unanswered round proves the carrier silent — re-dial before the next rung.
+      bus.kickWsZombie?.("hydrate-timeout");
       // Nobody answered — the pane would hold a partial view with no way to page back.
       scheduleHydrateRetry();
+      onSettled?.();
     }, HYDRATE_TIMEOUT_MS);
     releaseTimerRef.current = releaseTimer;
     // Defaults for a brand-new session only; the host ignores them once it has a snapshot.
@@ -758,7 +963,7 @@ export function useAiSession({
         snapshotSeq: res?.session?.seq,
         appliedSeq: appliedSeqRef.current,
         sameLog: epoch === logEpochRef.current
-      })) return;
+      })) { onSettled?.(); return; }
       let gateToRestore = null;
       let queueToRestore = null;
       const events = res?.session?.events;
@@ -789,6 +994,8 @@ export function useAiSession({
         // The host replays only the tail of a long log; the rest is fetched on scroll-up.
         olderSeqRef.current = events[0]?.seq ?? 0;
         setHasOlder(Boolean(res.session.hasMore) && events.length > 0);
+        // The ack's window is the tail the cache should hold from here on.
+        setTailFromAck(events, res.session.hasMore);
         // An empty host log means the host has nothing for this session yet (fresh
         // one, or a legacy session created before the daemon owned state). Leave
         // whatever the client already has instead of blanking it.
@@ -902,101 +1109,121 @@ export function useAiSession({
         // the carrier reports a dead RTC) means the host was never reached, so the rung
         // armed while this round was in flight keeps its timer — and one that was never
         // armed is armed now, or that dropped frame costs the pane its history for good.
-        if (res?.ok) { setSynced(true); setHydrateFailed(false); clearHydrateRetry(); }
+        if (res?.ok) {
+          setSynced(true); setHydrateFailed(false); clearHydrateRetry();
+          lastHydrateOkAtRef.current = Date.now();
+          surfaceOrphanPrompts(sessionId, res.session?.events);
+        }
         else scheduleHydrateRetry();
+        onSettled?.();
       }
     });
-  }, [sessionId, engine, workspacePath, bus, setTurnRunning, scheduleHydrateRetry, clearHydrateRetry]);
+  }, [sessionId, engine, workspacePath, bus, setTurnRunning, scheduleHydrateRetry, clearHydrateRetry, noteTail, setTailFromAck]);
 
-  const requestHydrate = useCallback(() => {
+  // The one door for every cheap trigger (visibility, resume, connect). A repair asked
+  // for by a live verdict (epoch/gap) goes straight to the lane, past this door.
+  const requestRecover = useCallback(() => {
     // Offline, the send would sit in the carrier's buffer to be answered by a host that
     // has moved on — the bus "connect" trigger asks again once there is someone to ask.
     if (!useConnectionStore.getState().connected) return;
-    if (hydrateDebounceRef.current) return; // burst already pending
-    hydrateDebounceRef.current = setTimeout(() => {
-      hydrateDebounceRef.current = null;
-      hydrateNow();
-    }, RECOVER_DEBOUNCE_MS);
-  }, [hydrateNow]);
+    // Always the probe: it compares watermarks, patches a gap in place and escalates to a
+    // full hydrate only when the log really moved. Hydrating here replayed a tail that
+    // replaced the pages the reader had loaded, so every resume wiped the chat.
+    laneRef.current?.request("recover");
+  }, []);
 
-  // Check whether host has newer events before doing a full destructive hydrate
-  const peekSeqCheck = useCallback(() => {
-    if (!bus || !sessionId) return;
-    if (!isVisibleRef.current) {
-      pendingRecoverRef.current = "visible";
-      return;
-    }
-    if (!useConnectionStore.getState().connected) return;
-    if (hydratingRef.current) return;
-    if (peekDebounceRef.current) return;
-    peekDebounceRef.current = setTimeout(() => {
-      peekDebounceRef.current = null;
-      if (!isVisibleRef.current || hydratingRef.current) return;
-      // A peek nobody answers (an older agent without the handler, or every carrier
-      // zombie on a mobile resume) must not leave the pane stale: fall back to the
-      // full hydrate, whose own ladder keeps re-asking. A late ack after the deadline
-      // still runs its comparison — requestHydrate is debounced, so the worst case
-      // is a no-op, never a second round.
-      let answered = false;
-      const deadline = setTimeout(() => {
-        if (answered) return;
-        termLog("ai-hydrate", "peekSeq: no ack → full hydrate");
-        requestHydrate();
-      }, PEEK_TIMEOUT_MS);
-      peekDeadlineRef.current = deadline;
-      bus.emit("ai:peekSeq", { sessionId, haveSeq: appliedSeqRef.current, epoch: logEpochRef.current }, (res) => {
-        answered = true;
-        clearTimeout(deadline);
-        peekDeadlineRef.current = null;
-        if (!res?.ok || typeof res.seq !== "number") {
-          requestHydrate();
-          return;
-        }
-        const lastSeq = appliedSeqRef.current;
-        const currentTurnRunning = Boolean(useAiStore.getState().bySession[sessionId]?.isTurnRunning);
-        const currentQueueLen = useAiStore.getState().bySession[sessionId]?.queue?.length || 0;
-        const hostQueueLen = typeof res.queueLength === "number" ? res.queueLength : currentQueueLen;
-        if (res.seq === lastSeq && Boolean(res.isTurnRunning) === currentTurnRunning && hostQueueLen === currentQueueLen) {
-          termLog("ai-hydrate", "peekSeq: nothing missed", { seq: lastSeq });
-          return;
-        }
-        termLog("ai-hydrate", "peekSeq: state changed", { fromSeq: lastSeq, toSeq: res.seq, turn: res.isTurnRunning });
-        requestHydrate();
-      });
-    }, RECOVER_DEBOUNCE_MS);
-  }, [bus, sessionId, requestHydrate]);
+  // The lane's probe runner: check where the host is before pulling anything.
+  const runProbe = useCallback((done) => {
+    const b = busRef.current;
+    if (!b || !sessionId) { done(); return; }
+    if (!isVisibleRef.current) { pendingRecoverRef.current = "visible"; done(); return; }
+    if (!useConnectionStore.getState().connected) { done(); return; }
+    // A hydrate in flight will replay whatever the probe would find — let it answer.
+    if (hydratingRef.current) { done(); return; }
+    let settled = false;
+    const finish = () => { if (!settled) { settled = true; done(); } };
+    // A peek nobody answers (an older agent without the handler, or every carrier
+    // zombie on a mobile resume) must not leave the pane stale: fall back to the
+    // full hydrate, whose own ladder keeps re-asking. A late ack after the deadline
+    // still runs its comparison — the lane coalesces the two asks into one round.
+    let answered = false;
+    const deadline = setTimeout(() => {
+      if (answered) return;
+      termLog("ai-hydrate", "peekSeq: no ack → full hydrate");
+      // No ack for a full timeout: the ask may sit in a zombie WS — re-dial first.
+      b.kickWsZombie?.("peek-timeout");
+      laneRef.current?.request("hydrate");
+      finish();
+    }, PEEK_TIMEOUT_MS);
+    peekDeadlineRef.current = deadline;
+    b.emit("ai:peekSeq", { sessionId, haveSeq: appliedSeqRef.current, epoch: logEpochRef.current }, (res) => {
+      answered = true;
+      clearTimeout(deadline);
+      peekDeadlineRef.current = null;
+      if (!res?.ok || typeof res.seq !== "number") {
+        laneRef.current?.request("hydrate");
+        finish();
+        return;
+      }
+      const lastSeq = appliedSeqRef.current;
+      const currentTurnRunning = Boolean(useAiStore.getState().bySession[sessionId]?.isTurnRunning);
+      const currentQueueLen = useAiStore.getState().bySession[sessionId]?.queue?.length || 0;
+      const hostQueueLen = typeof res.queueLength === "number" ? res.queueLength : currentQueueLen;
+      if (res.seq === lastSeq && Boolean(res.isTurnRunning) === currentTurnRunning && hostQueueLen === currentQueueLen) {
+        termLog("ai-hydrate", "peekSeq: nothing missed", { seq: lastSeq });
+        finish();
+        return;
+      }
+      // Watermark known to be the same log: nothing structural changed. Behind on it
+      // (a mobile sleep that lost the streaming tail) → patch the missing range in
+      // place. The destructive replay here is what wiped the older pages the reader
+      // had scrolled up to load and snapped the view to the tail on every resume.
+      const sameLog = res.epoch != null && res.epoch === logEpochRef.current;
+      if (res.seq > lastSeq && sameLog) { laneRef.current?.request("gap"); finish(); return; }
+      // Flag-only drift with the watermark in sync: no events were lost — patch the
+      // flag, keep the view exactly where it is.
+      if (res.seq === lastSeq && sameLog && hostQueueLen === currentQueueLen) {
+        termLog("ai-hydrate", "peekSeq: turn-flag drift patched in place", { seq: lastSeq, turn: res.isTurnRunning });
+        useAiStore.getState().setTurnRunning(sessionId, Boolean(res.isTurnRunning));
+        finish();
+        return;
+      }
+      termLog("ai-hydrate", "peekSeq: state changed", { fromSeq: lastSeq, toSeq: res.seq, turn: res.isTurnRunning });
+      laneRef.current?.request("hydrate");
+      finish();
+    });
+  }, [sessionId]);
 
-  // The ladder's timer re-asks through the door, so an automatic retry keeps the same
-  // spacing. A tap is the user saying "now": drop the pending rung and ask immediately —
-  // otherwise the pane would spin for another 6s over a request the user already made.
+  // Runners reach the lane through refs — the lane is built once, above.
+  useEffect(() => {
+    hydrateNowRef.current = hydrateNow;
+    runProbeRef.current = runProbe;
+  });
+
+  // A tap is the user saying "now": re-dial a zombie carrier and ask past the debounce.
   const retryNow = useCallback(() => {
-    // A ready-but-silent WS zombie cannot answer this ask — reconnect it first;
-    // the re-ask below (or the ladder) then lands on the fresh carrier.
     bus?.kickWsZombie?.("refresh");
     clearHydrateRetry();
-    hydrateNow();
-  }, [bus, clearHydrateRetry, hydrateNow]);
-
-  // The debounce and the ladder's timer both fire outside React's render, so they reach
-  // the newest callback through a ref rather than through a captured closure. Nothing
-  // clears this: the only caller is the ladder's timer, and the effect below stops it.
-  useEffect(() => {
-    doorRef.current = { request: requestHydrate };
-  }, [requestHydrate]);
+    laneRef.current?.request("now", { immediate: true });
+  }, [bus, clearHydrateRetry]);
 
   // Leaving the session stops every timer that could emit for it, and drops the gate. Both
   // matter for a StrictMode remount, where the refs survive: the ack of a round in flight
   // is cancelled by this cleanup, so without the flag being cleared the next mount would
   // find the gate shut and buffer every live event forever.
   useEffect(() => () => {
-    if (hydrateDebounceRef.current) clearTimeout(hydrateDebounceRef.current);
-    if (peekDebounceRef.current) clearTimeout(peekDebounceRef.current);
     if (peekDeadlineRef.current) clearTimeout(peekDeadlineRef.current);
-    if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
     if (releaseTimerRef.current) clearTimeout(releaseTimerRef.current);
-    hydrateDebounceRef.current = peekDebounceRef.current = peekDeadlineRef.current = retryTimerRef.current = releaseTimerRef.current = null;
+    if (gapTimerRef.current) clearTimeout(gapTimerRef.current);
+    peekDeadlineRef.current = releaseTimerRef.current = gapTimerRef.current = null;
+    // Reset, then stub: an in-flight ack settling after unmount must not arm new
+    // rounds for a pane that no longer exists (a remount builds its own lane).
+    laneRef.current?.reset();
+    laneRef.current = { request() {}, busy() { return false; }, clearPending() {}, reset() {} };
     hydratingRef.current = false;
     pendingLiveRef.current = [];
+    for (const { watch } of echoWatchRef.current.values()) watch.settle();
+    echoWatchRef.current.clear();
   }, []);
 
   // Initial mount, and every remount that changes the session's identity.
@@ -1018,7 +1245,7 @@ export function useAiSession({
       // Its watermark/generation and probe clocks belong to the previous chat.
       logEpochRef.current = null;
       gapHeldRef.current = [];
-      gapBusyRef.current = false;
+      laneRef.current?.reset();
       lastEventAtRef.current = 0;
       peekMissRef.current = 0;
       promptSentAtRef.current = 0;
@@ -1026,14 +1253,16 @@ export function useAiSession({
     // Held in a ref: re-running this effect on a store-action identity change would
     // re-emit ai:create over a session that is mid-stream.
     initSessionRef.current(sessionId);
-    // Straight at the host, NOT through requestHydrate: on a cold start no carrier is
+    // Paint the cached tail while the host replay is on its way; the ack replaces it.
+    loadCachedTail();
+    // Straight at the host, NOT through the lane: on a cold start no carrier is
     // ready yet and that door would drop the ask, while the carrier's "connect" only
     // fires on LATER rejoins — the pane would sit empty over a healthy host until the
     // user hit refresh. PM buffers the emit and flushes it on the first adapter, which
     // is the behavior this mount has always relied on. A rejoin landing in the same
     // breath is then held off by the in-flight gate above, not by a delay.
     return hydrateNow();
-  }, [sessionId, hydrateNow, clearHydrateRetry]);
+  }, [sessionId, hydrateNow, clearHydrateRetry, loadCachedTail]);
 
   // Resume recovery and visibility: only check seq if visible; hidden panes defer.
   useEffect(() => {
@@ -1041,9 +1270,8 @@ export function useAiSession({
     const pending = pendingRecoverRef.current;
     if (!pending) return;
     pendingRecoverRef.current = null;
-    if (pending === "reconnect") requestHydrate();
-    else peekSeqCheck();
-  }, [isVisible, requestHydrate, peekSeqCheck]);
+    requestRecover();
+  }, [isVisible, requestRecover]);
 
   // Backgrounded-then-resumed, and carrier rejoin (the same triggers the terminal
   // recovers on). A live app that never remounts has no other path: the store is not
@@ -1055,14 +1283,19 @@ export function useAiSession({
     // Online is the door's own check, so a resume while offline needs no branch here —
     // the `connected` effect below asks once there is someone to answer.
     const onVisible = () => {
-      if (!document.hidden) peekSeqCheck();
+      if (!document.hidden) requestRecover();
+    };
+    // Expo WebView never flips document.hidden — the shell's native event is the resume signal there.
+    const onAppVisible = (e) => {
+      if (!e.detail?.hidden) requestRecover();
     };
     const onConnect = () => {
+      autoResendRef.current?.(); // offline-lost prompts go out the moment a carrier is back
       if (!isVisibleRef.current) {
         pendingRecoverRef.current = "reconnect";
         return;
       }
-      requestHydrate();
+      requestRecover();
     };
     // Page Lifecycle `resume`: Chrome Android wakes a frozen tab without firing a
     // visibilitychange (the same gap pmWatchers covers on the transport side). bfcache
@@ -1070,18 +1303,20 @@ export function useAiSession({
     bus.on("connect", onConnect);
     document.addEventListener("visibilitychange", onVisible);
     document.addEventListener("resume", onVisible);
+    document.addEventListener("app-visibility", onAppVisible);
     return () => {
       bus.off("connect", onConnect);
       document.removeEventListener("visibilitychange", onVisible);
       document.removeEventListener("resume", onVisible);
+      document.removeEventListener("app-visibility", onAppVisible);
     };
-  }, [bus, sessionId, peekSeqCheck, requestHydrate]);
+  }, [bus, sessionId, requestRecover]);
 
   // The carrier coming back is a trigger in its own right, not just a prelude to the
   // bus "connect" above. That event only fires on a rejoin the PM judges worthwhile
   // (_maybeFireRejoin), and it stays silent whenever the OTHER carrier is still ready —
   // so the case this covers is a phone that slept through a full outage: the resume fires
-  // while both carriers are dead, requestHydrate drops that ask, and the carriers then
+  // while both carriers are dead, the trigger ask is dropped, and the carriers then
   // return without ever announcing a "connect". The pane kept its pre-sleep view, and the
   // refresh button was the only way back. Asking here is that dropped ask, remembered.
   //
@@ -1092,13 +1327,14 @@ export function useAiSession({
     const was = wasConnectedRef.current;
     wasConnectedRef.current = connected;
     if (connected && !was) {
+      autoResendRef.current?.();
       if (!isVisibleRef.current) {
         pendingRecoverRef.current = "reconnect";
         return;
       }
-      requestHydrate();
+      requestRecover();
     }
-  }, [connected, requestHydrate]);
+  }, [connected, requestRecover]);
 
   // 2. Subscribe to AI bus events
   useEffect(() => {
@@ -1201,6 +1437,7 @@ export function useAiSession({
         olderSeqRef.current = payload.data?.fromSeq ?? 0;
         setHasOlder(Boolean(payload.data?.hasMore));
         gapHeldRef.current = [];
+        noteTail(null, "conversation_reset", null);
         queueEvent(payload.event, payload.data);
         return;
       }
@@ -1212,7 +1449,7 @@ export function useAiSession({
         // A newer log generation whose reset never arrived: the watermark now swallows
         // every live event. Only a full pull re-establishes the truth.
         gapHeldRef.current = [];
-        doorRef.current.request?.();
+        laneRef.current?.request("hydrate");
         return;
       } else if (verdict === "stale" || verdict === "dup") return;
       else if (verdict === "gap") {
@@ -1220,13 +1457,16 @@ export function useAiSession({
         gapHeldRef.current.push(payload);
         if (gapHeldRef.current.length > MAX_GAP_HELD) {
           gapHeldRef.current = [];
-          doorRef.current.request?.();
+          laneRef.current?.request("hydrate");
           return;
         }
-        scheduleGapFetch();
+        laneRef.current?.request("gap");
         return;
       }
       if (payload.seq != null) appliedSeqRef.current = payload.seq;
+      noteTail(payload.seq, payload.event, payload.data);
+      // A finished turn is a settled tail; anything else would cache half a sentence.
+      if (payload.event === "turn_complete") scheduleCacheWrite();
       applyLive(payload.event, payload.data);
     };
 
@@ -1241,34 +1481,30 @@ export function useAiSession({
       queueEvent(event, data);
     }
 
-    // Events that arrived while the hole was being filled, re-checked one by one;
-    // a hole that persists arms the next fetch (bounded by MAX_GAP_HELD above).
+    // Events that arrived while the hole was being filled, re-checked by the shared
+    // drain law; a hole that persists asks for the range again (bounded by MAX_GAP_HELD).
     const drainGapHeld = () => {
       const held = gapHeldRef.current;
       gapHeldRef.current = [];
-      let blocked = false;
-      for (const p of held) {
-        if (blocked) { gapHeldRef.current.push(p); continue; }
-        const v = classifyLiveEvent(p, { appliedSeq: appliedSeqRef.current, logEpoch: logEpochRef.current });
-        if (v === "gap") { gapHeldRef.current.push(p); blocked = true; continue; }
-        if (v === "stale" || v === "dup") continue;
-        if (v === "resync") { gapHeldRef.current = []; doorRef.current.request?.(); return; }
-        if (v === "adopt") logEpochRef.current = p.epoch;
-        if (p.seq != null) appliedSeqRef.current = p.seq;
-        applyLive(p.event, p.data);
+      const plan = splitByHole(held, { appliedSeq: appliedSeqRef.current, logEpoch: logEpochRef.current });
+      if (plan.resync) { laneRef.current?.request("hydrate"); return; }
+      appliedSeqRef.current = plan.appliedSeq;
+      logEpochRef.current = plan.logEpoch;
+      for (const p of plan.apply) { applyLive(p.event, p.data); noteTail(p.seq, p.event, p.data); }
+      if (plan.held.length) {
+        gapHeldRef.current = plan.held;
+        laneRef.current?.request("gap");
       }
-      if (blocked) scheduleGapFetch();
     };
 
-    // Fetch the missing range and splice it in. Anything the fetch cannot make safe —
-    // an older host (timeout), another generation, a gap past the byte cap, or a
-    // compacted stream record overlapping applied text — resyncs whole instead.
-    const scheduleGapFetch = () => {
-      if (gapBusyRef.current || hydratingRef.current) return;
-      if (!useConnectionStore.getState().connected) return;
+    // The lane's gap runner: fetch the missing range and splice it in. Anything the
+    // fetch cannot make safe — an older host (timeout), another generation, a gap past
+    // the byte cap, or a compacted stream record overlapping applied text — resyncs
+    // whole instead.
+    const runGapFetch = (done) => {
+      if (hydratingRef.current) { done(); return; }
       const b = busRef.current;
-      if (!b) return;
-      gapBusyRef.current = true;
+      if (!b || !useConnectionStore.getState().connected) { done(); return; }
       const after = appliedSeqRef.current;
       const epoch = logEpochRef.current;
       let settled = false;
@@ -1276,30 +1512,41 @@ export function useAiSession({
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        gapBusyRef.current = false;
+        gapTimerRef.current = null;
         // A hydrate that started meanwhile supersedes any patch.
-        if (hydratingRef.current) return;
+        if (hydratingRef.current) { done(); return; }
         const plan = fetchedIsSafe(res?.ok ? res.events || [] : [], appliedSeqRef.current);
         if (!res?.ok || res.resync || res.epoch !== epoch || res.hasMore || !plan.safe) {
           gapHeldRef.current = [];
-          doorRef.current.request?.();
+          laneRef.current?.request("hydrate");
+          done();
           return;
         }
         for (const ev of plan.apply) {
           appliedSeqRef.current = ev.seq;
           applyLive(ev.event, ev.data);
+          noteTail(ev.seq, ev.event, ev.data);
         }
         drainGapHeld();
+        done();
       };
-      const timer = setTimeout(() => finish(null), GAP_FETCH_TIMEOUT_MS);
+      const timer = setTimeout(() => {
+        // An unanswered range fetch is a silent carrier — re-dial before the resync.
+        b.kickWsZombie?.("gap-timeout");
+        finish(null);
+      }, GAP_FETCH_TIMEOUT_MS);
+      gapTimerRef.current = timer;
       b.emit("aiSince", { sessionId, after, epoch }, finish);
     };
+    gapRunnerRef.current = runGapFetch;
 
     // Silence probe: a turn quiet for 10s may have lost its tail — the carrier drops
     // events nobody re-sends. Ask the host where it is; behind twice in a row (an
     // in-flight event can mimic a gap once) patches the hole or resyncs whole.
+    let confirmTimer = null;
+    let probeDeadline = null;
     const probeSilence = () => {
-      if (probeBusyRef.current || hydratingRef.current || gapBusyRef.current) return;
+      if (probeBusyRef.current || hydratingRef.current || laneRef.current?.busy()) return;
       if (!isVisibleRef.current || !useConnectionStore.getState().connected) return;
       probeBusyRef.current = true;
       let settled = false;
@@ -1312,18 +1559,35 @@ export function useAiSession({
           (res.epoch != null && logEpochRef.current != null && res.epoch !== logEpochRef.current)
           || (typeof res.seq === "number" && res.seq > appliedSeqRef.current)
         );
+        // A probe nobody answered may have gone into a zombie WS — re-dial the carrier.
+        if (!res?.ok) busRef.current?.kickWsZombie?.("silence-probe");
+        // The host says the turn is over while the pane still shows it running — a lost
+        // turn_complete is exactly that. Close it, and pull the log if the answer row is
+        // empty: the pane missed the whole stream, not just its tail.
+        if (res?.ok && res.isTurnRunning === false && typeof res.seq === "number"
+          && res.seq === appliedSeqRef.current
+          && useAiStore.getState().bySession[sessionId]?.isTurnRunning) {
+          termLog("ai-hydrate", "silence probe: turn ended unseen", { sessionId, seq: res.seq });
+          useAiStore.getState().setTurnRunning(sessionId, false);
+          if (emptyAnswerRow(useAiStore.getState().bySession[sessionId]?.messages)) {
+            laneRef.current?.request("hydrate");
+          }
+          peekMissRef.current = 0;
+          return;
+        }
         if (!behind) {
           peekMissRef.current = 0;
           silenceNeedRef.current = Math.min(silenceNeedRef.current * 2, SILENCE_PEEK_MAX_MS);
           return;
         }
         peekMissRef.current++;
-        if (peekMissRef.current === 1) { setTimeout(probeSilence, GAP_CONFIRM_MS); return; }
+        if (peekMissRef.current === 1) { confirmTimer = setTimeout(probeSilence, GAP_CONFIRM_MS); return; }
         peekMissRef.current = 0;
-        if (res.epoch != null && res.epoch === logEpochRef.current) scheduleGapFetch();
-        else doorRef.current.request?.();
+        if (res.epoch != null && res.epoch === logEpochRef.current) laneRef.current?.request("gap");
+        else laneRef.current?.request("hydrate");
       };
       const timer = setTimeout(() => finish(null), PEEK_TIMEOUT_MS);
+      probeDeadline = timer;
       busRef.current?.emit("ai:peekSeq", { sessionId, haveSeq: appliedSeqRef.current, epoch: logEpochRef.current }, finish);
     };
     const silenceTimer = setInterval(() => {
@@ -1339,15 +1603,29 @@ export function useAiSession({
     return () => {
       bus.off("ai:event", handleAiEvent);
       clearInterval(silenceTimer);
+      if (confirmTimer) clearTimeout(confirmTimer);
+      if (probeDeadline) clearTimeout(probeDeadline);
+      gapRunnerRef.current = null;
+      if (gapTimerRef.current) clearTimeout(gapTimerRef.current);
+      gapTimerRef.current = null;
+      // The session is going away — persist whatever tail this pane last had.
+      if (cacheWriteTimerRef.current) clearTimeout(cacheWriteTimerRef.current);
+      cacheWriteTimerRef.current = null;
+      writeCacheNow();
       // A pane closing mid-frame must not swallow the last tokens it received.
       flushStreamed();
     };
-  }, [bus, sessionId, applyEvent]);
+  }, [bus, sessionId, applyEvent, noteTail, scheduleCacheWrite, writeCacheNow]);
 
   // 3. User actions
   const sendPrompt = useCallback(
-    (text, { attachments = null } = {}) => {
+    (text, { attachments = null, promptId = null, retries = 0 } = {}) => {
       if (!text && !attachments?.length) return;
+      // Resend and auto-resend skip the composer, where history is written — record
+      // here too so a swallowed send stays reusable (the store dedupes a repeat).
+      rememberPrompt(text);
+      // One id per typed prompt; a Resend reuses it so the host can drop a repeat.
+      const id = promptId || `p-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
       // Arm the silence probe's prompt window: a lost user_message echo leaves no
       // running flag for it to key on.
       promptSentAtRef.current = Date.now();
@@ -1365,38 +1643,129 @@ export function useAiSession({
       // the text they typed, not a path list.
       // #48: a dead-but-not-closed carrier swallows the emit silently — the ack wraps
       // it so the loss surfaces as a resendable error instead of vanishing.
-      if (b) {
-        emitPromptAck(
-          (payload, done) => b.emit("ai:prompt", payload, done),
-          {
-            sessionId,
-            message: text,
-            cwd: workspacePath,
-            ...(attachments?.length ? { attachments } : {})
-          },
-          PROMPT_ACK_TIMEOUT_MS,
-          (reason) => useAiStore.getState().setPromptError(sessionId, text, reason)
-        );
-      }
+      const onLost = (reason) => {
+        useAiStore.getState().clearPromptSending(sessionId, text);
+        // The host already echoed it: the ack was slow, the prompt is not lost.
+        if (promptAlreadyShown(sessionId, text)) { removePending(sessionId, id); return; }
+        useAiStore.getState().setPromptError(sessionId, text, reason, attachments, id, retries);
+        // Timeout = ready-but-silent carrier; re-dial the zombie WS so replay/Resend has a lane.
+        if (reason === "timeout" && b?.hostCaps?.promptDedupe) b.kickWsZombie?.("prompt-lost");
+      };
+      // An ack proves the host accepted it; the turn is alive when the echo arrives.
+      // Silence past the budget, with nothing shown/running/queued, is a prompt that
+      // died between ack and turn — offer it back instead of leaving the chat blank.
+      const armEchoWatch = () => {
+        if (!text) return;
+        const watch = createEchoWatchdog({
+          timeoutMs: PROMPT_ECHO_TIMEOUT_MS,
+          onMissing: () => {
+            echoWatchRef.current.delete(id);
+            if (promptAlreadyShown(sessionId, text)) return;
+            const st = useAiStore.getState().bySession[sessionId];
+            if (st?.isTurnRunning) return;
+            if (st?.queue?.some((q) => q.text === text)) return;
+            useAiStore.getState().clearPromptSending(sessionId, text);
+            useAiStore.getState().setPromptError(sessionId, text, "timeout", attachments, id, retries);
+          }
+        });
+        // A Resend reuses the id: the old watch must not fire against the new attempt.
+        const prev = echoWatchRef.current.get(id);
+        if (prev) { prev.watch.settle(); echoWatchRef.current.delete(id); }
+        echoWatchRef.current.set(id, { text, watch });
+        watch.arm();
+      };
+      // Survives a reload until the host confirms it.
+      if (text) addPending(sessionId, { id, text, page: PAGE_ID });
+      // No bus yet (host still connecting): say so instead of dropping the prompt.
+      if (!b) { onLost("offline"); return; }
+      if (text) useAiStore.getState().setPromptSending(sessionId, text);
+      emitPromptAck(
+        (payload, done) => b.emit("ai:prompt", payload, (res) => {
+          if (res?.ok) {
+            removePending(sessionId, id);
+            useAiStore.getState().clearPromptSending(sessionId, text);
+            armEchoWatch();
+          }
+          done(res);
+        }),
+        {
+          sessionId,
+          message: text,
+          cwd: workspacePath,
+          promptId: id,
+          ...(attachments?.length ? { attachments } : {})
+        },
+        PROMPT_ACK_TIMEOUT_MS,
+        onLost,
+        setTimeout, clearTimeout,
+        // The stream re-sent it after all — the host has it; resend would duplicate the turn.
+        () => clearEchoedPromptError(sessionId, text)
+      );
     },
     [sessionId, workspacePath]
   );
 
+  // A reconnect is the one moment a "lost" prompt is known to be retryable for free:
+  // the carrier is fresh, and the host's promptId dedupe makes a duplicate harmless.
+  const autoResendLost = useCallback(() => {
+    const lost = useAiStore.getState().bySession[sessionId]?.promptError;
+    if (!lost?.text) return;
+    // The store already shows it: the ack was slow, not lost — resending would run it twice.
+    if (promptAlreadyShown(sessionId, lost.text)) {
+      termLog("ai-prompt", "auto-resend skipped (already shown)", { text: String(lost.text).slice(0, 24) });
+      useAiStore.getState().clearPromptError(sessionId);
+      return;
+    }
+    // Without its own id the host cannot drop a repeat, and the resend becomes a new turn.
+    if (!lost.promptId) return;
+    // An older host cannot drop a repeated promptId — a silent resend could run the turn twice.
+    if (!busRef.current?.hostCaps?.promptDedupe) return;
+    const retries = (lost.retries || 0) + 1;
+    if (retries > PROMPT_AUTO_RETRY_MAX) return;
+    useAiStore.getState().clearPromptError(sessionId);
+    sendPrompt(lost.text, { attachments: lost.attachments || null, promptId: lost.promptId, retries });
+  }, [sessionId, sendPrompt]);
+  useEffect(() => {
+    autoResendRef.current = autoResendLost;
+  }, [autoResendLost]);
+
   const removeQueueItem = useCallback(
     (id) => {
+      const b = busRef.current; // no bus → the host still holds it; removing locally would lie
+      if (!b) return;
       const curr = useAiStore.getState().bySession[sessionId]?.queue || [];
-      useAiStore.getState().setQueue(sessionId, curr.filter((item) => item.id !== id));
-      const b = busRef.current; // no store fallback — null (foreign bus not up) must wait, not hit the main machine
-      b?.emit("ai:queueRemove", { sessionId, id });
+      const idx = curr.findIndex((item) => item.id === id);
+      if (idx === -1) return;
+      const item = curr[idx];
+      useAiStore.getState().setQueue(sessionId, curr.filter((x) => x.id !== id));
+      // A remove that never landed would let a deleted prompt RUN when the turn ends —
+      // put it back until the host's own queue_update says otherwise.
+      emitPromptAck(
+        (payload, done) => b.emit("ai:queueRemove", payload, done),
+        { sessionId, id },
+        RESOLVE_ACK_TIMEOUT_MS,
+        () => {
+          const q = [...(useAiStore.getState().bySession[sessionId]?.queue || [])];
+          q.splice(Math.min(idx, q.length), 0, item);
+          useAiStore.getState().setQueue(sessionId, q);
+        }
+      );
     },
     [sessionId]
   );
 
   const clearQueue = useCallback(
     () => {
+      const b = busRef.current;
+      const curr = useAiStore.getState().bySession[sessionId]?.queue || [];
+      if (!b || !curr.length) return;
       useAiStore.getState().setQueue(sessionId, []);
-      const b = busRef.current; // no store fallback — null (foreign bus not up) must wait, not hit the main machine
-      b?.emit("ai:queueClear", { sessionId });
+      emitPromptAck(
+        (payload, done) => b.emit("ai:queueClear", payload, done),
+        { sessionId },
+        RESOLVE_ACK_TIMEOUT_MS,
+        () => useAiStore.getState().setQueue(sessionId, curr) // same law as remove: undone until the host agrees
+      );
     },
     [sessionId]
   );

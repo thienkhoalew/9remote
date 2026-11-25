@@ -2,6 +2,7 @@ import fs from "fs";
 import path from "path";
 import sharp from "sharp";
 import { execSync } from "child_process";
+import { createRequire } from "module";
 import { fileURLToPath } from "url";
 import { REMOTE_CONFIG } from "./REMOTE_CONFIG.js";
 import * as capture from "./adapters/captureAdapter.js";
@@ -10,24 +11,12 @@ import { getGpuResize, resizeTile, resizeTilesBatch } from "./adapters/gpuResize
 import { getVImageResize, resizeTileVImage } from "./adapters/vImageResize.js";
 import { FrameMetrics } from "./metrics.js";
 import { remoteLog } from "./utils/remoteLog.js";
+import { mapLimit } from "./utils/mapLimit.js";
+export { mapLimit };
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
-// Map with bounded concurrency, preserving order; slotId (0..limit-1) is stable per worker.
-export async function mapLimit(items, limit, fn) {
-  const ret = new Array(items.length);
-  let i = 0;
-  const width = Math.min(limit, items.length);
-  const workers = Array.from({ length: width }, async (_, slotId) => {
-    while (i < items.length) {
-      const idx = i++;
-      ret[idx] = await fn(items[idx], idx, slotId);
-    }
-  });
-  await Promise.all(workers);
-  return ret;
-}
+const requireCjs = createRequire(import.meta.url);
 
 export class TileManager {
   constructor(robot, opts = {}) {
@@ -113,10 +102,10 @@ export class TileManager {
     this.tilesPerColumn = Math.ceil(this.scaledHeight / this.tileSize);
     this.totalTiles = this.tilesPerRow * this.tilesPerColumn;
 
-    const MAX_TILES = 100;
-    if (this.totalTiles > MAX_TILES) {
-      const optimalTileSize = Math.ceil(Math.sqrt((this.scaledWidth * this.scaledHeight) / MAX_TILES));
-      this.tileSize = Math.max(optimalTileSize, 120);
+    const { maxTiles, minTileSize } = REMOTE_CONFIG.pipeline;
+    if (this.totalTiles > maxTiles) {
+      const optimalTileSize = Math.ceil(Math.sqrt((this.scaledWidth * this.scaledHeight) / maxTiles));
+      this.tileSize = Math.max(optimalTileSize, minTileSize);
       this.tilesPerRow = Math.ceil(this.scaledWidth / this.tileSize);
       this.tilesPerColumn = Math.ceil(this.scaledHeight / this.tileSize);
       this.totalTiles = this.tilesPerRow * this.tilesPerColumn;
@@ -148,15 +137,10 @@ export class TileManager {
 
   detectDpiScale() {
     if (process.platform === "darwin") {
-      const testCapture = this.robot.screen.capture(0, 0, this.screenWidth, this.screenHeight);
-      const actualWidth = testCapture.byteWidth / testCapture.bytesPerPixel;
-      const scale = actualWidth / this.screenWidth;
-
-      if (scale >= 1.9 && scale <= 2.1) {
-        this.dpiScale = 2;
-      } else {
-        this.dpiScale = 1;
-      }
+      // Read the display's scale factor instead of probing with a capture: a
+      // robotjs capture SIGSEGVs the whole host when the screen is locked or
+      // asleep (screen-sleep probe), and that probe only ever wanted the scale.
+      this.dpiScale = this._detectDpiScaleDarwin();
     } else if (process.platform === "win32") {
       this.dpiScale = this._detectDpiScaleWin32();
     } else {
@@ -165,6 +149,32 @@ export class TileManager {
 
     this.captureWidth = Math.floor(this.screenWidth * this.dpiScale);
     this.captureHeight = Math.floor(this.screenHeight * this.dpiScale);
+  }
+
+  _detectDpiScaleDarwin() {
+    const toScale = (n) => {
+      const v = Number(n);
+      return v >= 1 && v <= 4 ? v : 1;
+    };
+    // node-screenshots reports the backing scale per monitor without touching
+    // the framebuffer (the default capture lib on darwin is nodeScreenshots).
+    try {
+      if (this._monitor?.scaleFactor) return toScale(this._monitor.scaleFactor());
+      const mod = requireCjs("node-screenshots");
+      const Monitor = mod.Monitor || mod.default?.Monitor;
+      const all = Monitor.all() || [];
+      const main = all.find((m) => m.isPrimary?.()) || all[0];
+      if (main) return toScale(main.scaleFactor());
+    } catch { /* fall through */ }
+    // NSScreen.backingScaleFactor via JXA: answers with the screen locked and
+    // asleep, where Monitor.all() returns nothing. No pixel capture anywhere.
+    try {
+      const out = execSync(
+        'osascript -l JavaScript -e \'ObjC.import("AppKit"); $.NSScreen.mainScreen.backingScaleFactor\'',
+        { encoding: "utf8", timeout: 3000 }
+      ).trim();
+      return toScale(out);
+    } catch { return 1; }
   }
 
   _detectDpiScaleWin32() {

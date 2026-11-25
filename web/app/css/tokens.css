@@ -1,0 +1,192 @@
+/* Default = dark theme tokens (neutral zinc) */
+:root {
+  --bg: #0a0a0a;
+  --surface: #191919;
+  --surface-2: #222222;
+  --surface-3: #2a2a2a;
+  --border: rgba(255, 255, 255, 0.16);
+  --border-subtle: rgba(255, 255, 255, 0.12);
+  --border-composer: rgba(255, 255, 255, 0.12);
+  --text: #fafafa;
+  --text-muted: #a1a1a1;
+  --text-subtle: #737373;
+  --danger: #ff6568;
+  --success: #22c55e;
+  --warning: #fbbf24;
+  --success-rgb: 34, 197, 94;
+  --danger-rgb: 255, 101, 104;
+  --warning-rgb: 251, 191, 36;
+  --git-added: #81b88b;
+  --git-modified: #e2c08d;
+  --git-deleted: #c74e39;
+  --git-untracked: #73c991;
+  --shadow-soft: 0 1px 2px 0 rgba(0,0,0,0.4);
+  --shadow-elev:
+    inset 0 1px 0 0 rgba(255,255,255,0.04),
+    0 1px 2px rgba(0,0,0,0.5),
+    0 16px 48px -8px rgba(0,0,0,0.65);
+  --shadow-focus: 0 0 0 3px rgba(229,106,74,0.18);
+  /* Glass card (terminal-glass) — sits well above the near-black canvas, or it reads
+     as a smudge under the cine-bg grain */
+  --card-glass-bg: rgba(25,25,25,0.92);
+  --card-glass-border: rgba(255,255,255,0.14);
+  --card-shine: inset 0 1px 0 rgba(255,255,255,0.16);
+  color-scheme: dark;
+
+  /* Liquid glass (dialog/popover layer). Tint is a LOW-alpha lift, not a solid
+     surface: the material has to read through to whatever sits behind it. */
+  --lg-blur: 20px;
+  --lg-blur-drawer: 28px;
+  --lg-sat: 1.6;
+  --lg-tint-dialog: rgba(38,38,42,0.72);
+  --lg-tint-menu: rgba(34,34,38,0.78);
+  --lg-tint-drawer: rgba(30,30,34,0.84);
+  --lg-tint-panel: rgba(28,28,31,0.88);
+  --lg-rim: rgba(255,255,255,0.14);
+  --lg-edge: rgba(255,255,255,0.10);
+  --lg-shade: rgba(0,0,0,0.4);
+  --lg-sheen: linear-gradient(180deg, rgba(255,255,255,0.10), rgba(255,255,255,0) 55%);
+  --lg-lift-dialog: 0 20px 50px -10px rgba(0,0,0,0.65), 0 2px 8px rgba(0,0,0,0.4);
+  --lg-lift-menu: 0 16px 36px -4px rgba(0,0,0,0.55);
+  /* Grouped content card (settings sections, menu groups). 9love's inset-grouped
+     surface: a shade lighter than the page, no border, one soft lift. */
+  --lg-tint-card: rgba(44,44,50,0.66);
+  --lg-lift-card: 0 8px 24px rgba(0,0,0,0.35), 0 1px 3px rgba(0,0,0,0.25);
+  /* Row divider inside a grouped card — the only line that survives the no-border
+     rule, because rows in one plate do need a seam. */
+  --lg-hairline: rgba(255,255,255,0.12);
+  /* Floating pill nav — thicker material than a panel: it sits over live content
+     and has to stay legible while the terminal scrolls under it. */
+  --lg-blur-bar: 26px;
+  --lg-tint-bar: rgba(52,52,58,0.62);
+  --lg-sheen-strong: linear-gradient(180deg, rgba(255,255,255,0.16), rgba(255,255,255,0) 62%);
+  --lg-lift-bar: 0 10px 28px rgba(0,0,0,0.5), 0 2px 6px rgba(0,0,0,0.4);
+  /* Nav accent — 9love's coral pair: deep terracotta on paper, amber on obsidian. */
+  --nav-accent: #e8a84c;
+  --nav-accent-soft: rgba(232,168,76,0.14);
+
+  /* Chat bubbles — copied from 9love's .chat-canvas / html.dark .chat-canvas:
+     theirs = --color-field, mine = --color-coral. 9love's dark coral is AMBER
+     #e8a84c with dark brown text on it, not a tint of the brand orange. */
+  --chat-bubble-theirs: #2c2c31;
+  /* The border carries the separation, not the fill: over a #141414 canvas a fill
+     can only reach ~1.3:1 before it stops reading as a bubble at all. At 16% the
+     composited edge sits ~2.1:1 — visible, still quiet. */
+  --chat-bubble-theirs-line: rgba(255, 255, 255, 0.16);
+  --chat-bubble-theirs-text: #f5f5f7;
+  --chat-bubble-mine: #e8a84c;
+  --chat-meta-on-mine: #2a1a0c;
+
+  /* Dark mode brand — terracotta #E56A4A */
+  --brand-rgb: 229, 106, 74;
+  --color-brand-50: #2a1612;
+  --color-brand-100: #3d201a;
+  --color-brand-200: #5c2f1d;
+  --color-brand-300: #7a2f1d;
+  --color-brand-400: #cc5236;
+  --color-brand-500: #E56A4A;
+  --color-brand-600: #ea7855;
+  --color-brand-700: #ee8d6a;
+  --color-brand-800: #f4b59c;
+  --color-brand-900: #fadccf;
+
+  /* SessionList terminal card preview (dark) */
+  --card-term-bg: linear-gradient(155deg,#1c1d1f 0%,#151617 55%,#0f1011 100%);
+  --card-term-bg-off: linear-gradient(155deg,#161719,#0e0f10);
+  --card-border: rgba(255,255,255,0.08);
+  --card-ring: rgba(255,255,255,0.05);
+  --card-shadow: 0 8px 28px -6px rgba(0,0,0,0.7);
+  --card-titlebar-bg: rgba(44,44,46,0.9);
+  --card-titlebar-border: rgba(0,0,0,0.3);
+  --card-name-fg: rgba(255,255,255,0.55);
+  --card-body-fg: rgba(255,255,255,0.45);
+  --card-body-dim: rgba(255,255,255,0.35);
+  --card-btn-disabled: rgba(255,255,255,0.2);
+  --card-input-bg: rgba(0,0,0,0.4);
+  --card-input-fg: #ffffff;
+  --card-accent-green: #34d399;
+  --card-accent-cyan: #22d3ee;
+  --card-accent-amber: #fbbf24;
+  --card-accent-red: #f87171;
+}
+
+/* Light theme override - GitBook style */
+:root.light {
+  --bg: #F2F1ED;
+  --surface: #ffffff;
+  --surface-2: #ECEBE7;
+  --surface-3: #E1E0DC;
+  --border: #DEDFE2;
+  --border-subtle: #E5E4E0;
+  --border-composer: #D4D3CE;
+  --text: #0a0a0a;
+  --text-muted: #565D6A;
+  --text-subtle: #646C7A;
+  --danger: #cf222e;
+  --success: #10B981;
+  --warning: #B45309;
+  --success-rgb: 16, 185, 129;
+  --danger-rgb: 207, 34, 46;
+  --warning-rgb: 180, 83, 9;
+  /* Glass card: near-opaque on light — blur has nothing to frost onto there */
+  --card-glass-bg: rgba(255,255,255,0.86);
+  --card-glass-border: #DEDFE2;
+  --card-shine: inset 0 1px 0 rgba(255,255,255,0.9);
+
+  /* Liquid glass — light keeps the tint below the page brightness so the warm
+     ground reads through; the bright top rim + dark hairline carry the edge. */
+  --lg-blur: 20px;
+  --lg-blur-drawer: 28px;
+  --lg-sat: 1.45;
+  --lg-tint-dialog: rgba(255,255,255,0.88);
+  --lg-tint-menu: rgba(255,255,255,0.90);
+  --lg-tint-drawer: rgba(255,255,255,0.80);
+  --lg-tint-panel: rgba(255,255,255,0.86);
+  --lg-rim: rgba(255,255,255,0.90);
+  --lg-edge: rgba(20,20,24,0.10);
+  --lg-shade: rgba(0,0,0,0.08);
+  --lg-sheen: linear-gradient(135deg, rgba(255,255,255,0.55), rgba(255,255,255,0.08) 30%, rgba(255,255,255,0) 58%);
+  --lg-lift-dialog: 0 20px 50px -12px rgba(15,23,42,0.24), 0 2px 8px rgba(15,23,42,0.10);
+  --lg-lift-menu: 0 16px 36px -6px rgba(15,23,42,0.20);
+  --lg-tint-card: rgba(255,255,255,0.70);
+  --lg-lift-card: 0 4px 20px rgba(0,0,0,0.04), 0 1px 3px rgba(0,0,0,0.03);
+  --lg-hairline: rgba(60,60,67,0.14);
+  --lg-blur-bar: 26px;
+  --lg-tint-bar: color-mix(in srgb, #ffffff 64%, transparent);
+  --lg-sheen-strong: linear-gradient(135deg, rgba(255,255,255,0.62), rgba(255,255,255,0.10) 32%, rgba(255,255,255,0) 64%);
+  --lg-lift-bar: 0 12px 30px rgba(0,0,0,0.16), 0 3px 8px rgba(0,0,0,0.09);
+  --nav-accent: #a4492f;
+  --nav-accent-soft: rgba(164,73,47,0.10);
+
+  /* Chat bubbles — 9love light: --color-field / --color-coral / --color-on-accent. */
+  --chat-bubble-theirs: #ffffff;
+  --chat-bubble-theirs-line: rgba(60, 60, 67, 0.22);
+  --chat-bubble-theirs-text: #201d1a;
+  --chat-bubble-mine: #a4492f;
+  --chat-meta-on-mine: #ffffff;
+  --git-added: #587c0c;
+  --git-modified: #895503;
+  --git-deleted: #ad0707;
+  --git-untracked: #007100;
+  --shadow-soft: 0 1px 2px 0 rgba(0,0,0,0.04);
+  --shadow-elev: 
+    inset 0 1px 0 0 rgba(255,255,255,0.8),
+    0 1px 2px rgba(15,23,42,0.04),
+    0 12px 36px -8px rgba(15,23,42,0.10);
+  --shadow-focus: 0 0 0 3px rgba(230,138,110,0.18);
+  color-scheme: light;
+  --brand-rgb: 230, 138, 110;
+
+  /* GitBook-style softer brand (terracotta) for light mode — deep enough for
+     accent text to clear 4.5:1 on the warm ground. */
+  --color-brand-50: #fdf1ea;
+  --color-brand-100: #f8ddcd;
+  --color-brand-200: #f0c0a6;
+  --color-brand-300: #e09a78;
+  --color-brand-400: #d2704c;
+  --color-brand-500: #B44C2B;
+  --color-brand-600: #9a3f22;
+  --color-brand-700: #7e341c;
+  --color-brand-800: #622815;
+  --color-brand-900: #471c0e;
+}

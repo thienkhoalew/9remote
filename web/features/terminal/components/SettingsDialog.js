@@ -8,6 +8,7 @@ import {
   Power, Lock, PowerOff, Mic, Bug, Copy, Trash2, Link2
 } from "@/shared/components/ui/Icon";
 import { vibrate } from "@/shared/utils/vibration";
+import { reloadWhenHostReady } from "@/shared/utils/hostReady";
 import { useI18n } from "@/shared/i18n";
 import { SUPPORTED_LOCALES } from "@/shared/i18n/config";
 import { useTheme } from "@/shared/theme/ThemeProvider";
@@ -137,10 +138,10 @@ export default function SettingsDialog({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-      <div className="absolute inset-0 bg-black/60 backdrop-blur-[2px] fade-in" onClick={onClose} />
+      <div className="absolute inset-0 scrim fade-in" onClick={onClose} />
 
       <div
-        className="relative w-full max-w-4xl h-[85vh] max-h-[640px] card-elev flex overflow-hidden"
+        className="relative w-full max-w-4xl h-[85vh] max-h-[640px] card-elev flex overflow-hidden pop-in"
         role="dialog"
         aria-modal="true"
         aria-label={t("menu.settings")}
@@ -240,7 +241,7 @@ export default function SettingsDialog({
                     iconClass={reloading ? "animate-spin" : ""}
                     label={t("menu.reload")}
                     disabled={reloading}
-                    onClick={() => { vibrate(); setReloading(true); setTimeout(() => window.location.reload(), 150); }}
+                    onClick={async () => { vibrate(); setReloading(true); if (!(await reloadWhenHostReady())) setReloading(false); }}
                   />
                 </Group>
 

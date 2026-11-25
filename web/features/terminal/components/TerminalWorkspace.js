@@ -30,8 +30,12 @@ import AiPaneView from "@/features/ai/components/AiPaneView";
 import { AI_UI_OPTIONS } from "@/features/ai/constants";
 import ErrorBoundary from "@/shared/components/ui/ErrorBoundary";
 import useClampedMenu from "@/shared/hooks/useClampedMenu";
+import { useStableCallback } from "@/shared/hooks/useStableCallback";
 import { vibrate } from "@/shared/utils/vibration";
 import { PanelLeft } from "@/shared/components/ui/Icon";
+
+// One shared no-op: an inline arrow here handed the memoized keyboard a new prop per render.
+const noop = () => {};
 
 // Per-pane wrapper positioning terminal directly above the bottom input bar
 const PaneContentWrapper = memo(function PaneContentWrapper({ children }) {
@@ -130,7 +134,7 @@ function TerminalWorkspace({
 
   const {
     panesContainerRef, registerPaneApi, registerPaneElement, registerKeyboardTextApi,
-    handlePasteFallback, handleInputFocusChange, focusPane, focusKeyboardInput, scrollPaneIntoView
+    handlePasteFallback, handleInputFocusChange, focusKeyboardInput, scrollPaneIntoView
   } = paneRegistry;
 
   // The pinned mirror renders into this column via a portal, so the node is
@@ -205,16 +209,27 @@ function TerminalWorkspace({
   // The bottom status bar describes the FOCUSED pane's host — it resolves carrier,
   // platform, version, bus and file API itself through hostConn.
   // The chat pane's "+" opens a fresh chat of the same engine and closes the one it
-  // replaced — the tab strip must not grow an entry per chat.
-  const handleNewChat = useCallback((aiUi, sessionId) => {
+  // replaced — the tab strip must not grow an entry per chat. Reads the engine off the
+  // session (the caller has only an id) and stays one reference for every pane.
+  const handleNewChat = useStableCallback((sessionId) => {
+    const aiUi = AI_UI_OPTIONS.find((u) => u.id === agentBySession[sessionId]);
+    if (!aiUi) return;
     // The replaced terminal is still in the list, and it is leaving — counting it would
     // step the number up on every press.
     const index = sessions.filter((s) =>
       s.id !== sessionId && sessionWorkspaceId(s) === (activeWorkspaceId ?? null)
     ).length + 1;
     nav.handleReplaceSession(sessionId, `${aiUi.short || aiUi.label} ${index}`, aiUi, true);
-  }, [nav, sessions, activeWorkspaceId]);
+  });
   const filesRoot = rightPanelRoots[baseRoot] || baseRoot;
+  // Mobile status strip: reveal a pane's cwd in the files tab. Stable across renders —
+  // the strip is memoized and re-reading its own identity per render re-themed it.
+  const handleRevealCwd = useStableCallback((sessionId, cwd) => {
+    const wsPath = sessions.find((s) => s.id === sessionId)?.workspacePath;
+    setRightPanelRoot(wsPath, cwd || wsPath);
+    // Mobile-only strip: open on the workspace's saved tab, not forced to files
+    openRightPanel();
+  });
   // The right panel is memoized — these four would hand it a fresh closure per render.
   const handleRightPanelTabChange = useCallback(
     (tab) => rightPanel?.onTabChange(tab, baseRoot ?? ""),
@@ -465,8 +480,8 @@ function TerminalWorkspace({
             isFocused={isFocused}
             isDesktop={isDesktop}
             bgIndex={bgIndex}
-            onActivate={() => nav.handleSelectSession(sessionId)}
-            onNewChat={() => handleNewChat(aiUi, sessionId)}
+            onActivate={nav.handleSelectSession}
+            onNewChat={handleNewChat}
             onOpenRemote={onOpenRemote}
             onOpenMobile={onOpenMobile}
             onOpenArtifact={onOpenArtifact}
@@ -499,12 +514,16 @@ function TerminalWorkspace({
     );
   };
 
-  const renderKeyboard = (sessionId) => (
+  const renderKeyboard = (sessionId) => {
+    // Same host + workspace root as the pane, so the strip's count reads the shared
+    // snapshot for the machine the terminal actually runs on.
+    const stripSession = sessions.find((s) => s.id === sessionId);
+    const stripFileBus = stripSession?.hostKey ? connOf(stripSession.hostKey).fileBus : activeFileBus;
+    return (
     <MobileKeyboard
       bus={busFor(sessionId)}
       sessionId={sessionId}
-      onExpandChange={() => {}}
-      onRefocus={() => focusPane(sessionId)}
+      onExpandChange={noop}
       onRegisterTextApi={registerKeyboardTextApi}
       onInputFocusChange={handleInputFocusChange}
       platform={platform}
@@ -517,17 +536,15 @@ function TerminalWorkspace({
       statusStrip={(
         <MobileStatusStrip
           sessionId={sessionId}
+          fileBus={stripFileBus}
+          workspacePath={stripSession?.workspacePath || null}
           busRef={activeBusRef}
-          onReveal={(cwd) => {
-            const wsPath = sessions.find((s) => s.id === sessionId)?.workspacePath;
-            setRightPanelRoot(wsPath, cwd || wsPath);
-            // Mobile-only strip: open on the workspace's saved tab, not forced to files
-            openRightPanel();
-          }}
+          onReveal={handleRevealCwd}
         />
       )}
     />
-  );
+    );
+  };
 
   // Pair/welcome overlay covers the whole content column: drop the header and
   // display:none the panes so nothing paints or runs underneath it.
@@ -801,7 +818,7 @@ function TerminalWorkspace({
           <div
             className={isDesktop
               ? "overflow-hidden flex-shrink-0 transition-[width] duration-200 ease-out"
-              : "absolute inset-0 z-40 animate-in slide-in-from-bottom duration-200"}
+              : "absolute inset-0 z-40 sheet-rise"}
             style={isDesktop ? { width: editorOpen && editorExpanded ? editorPanel.width : 0 } : undefined}
             aria-hidden={isDesktop && !editorOpen}
           >
@@ -851,7 +868,7 @@ function TerminalWorkspace({
             backdrop — otherwise there is no way to dismiss it by tapping away. */}
         {rightPanel?.open && !isDesktop && (
           <div
-            className="absolute inset-0 z-20 bg-black/60 backdrop-blur-[2px] animate-in fade-in duration-200"
+            className="absolute inset-0 z-20 scrim fade-in"
             onClick={rightPanel.onToggle}
           />
         )}
@@ -861,7 +878,7 @@ function TerminalWorkspace({
           <div
             className={isDesktop
               ? "overflow-hidden flex-shrink-0 transition-[width] duration-200 ease-out"
-              : "absolute inset-y-0 right-0 z-30 w-[85%] max-w-sm shadow-elev animate-in slide-in-from-right duration-200"}
+              : "absolute inset-y-0 right-0 z-30 w-[85%] max-w-sm shadow-elev screen-in"}
             style={isDesktop ? { width: rightPanel?.open && expanded ? rightPanel.width : 0 } : undefined}
             aria-hidden={isDesktop && !rightPanel?.open}
           >
@@ -897,6 +914,7 @@ function TerminalWorkspace({
       {isDesktop && !showEmptyState && (
         <TerminalStatusBar
           cwd={activeSessionId ? (cwdBySession[activeSessionId] || activeSession?.cwd || activeWorkspace?.path || "") : ""}
+          workspacePath={activeSession?.workspacePath || activeWorkspace?.path || null}
           sessionId={activeSessionId}
           hostKey={activeSession?.hostKey || null}
           sessionName={activeSession ? activeSession?.name : ""}
@@ -911,7 +929,7 @@ function TerminalWorkspace({
       {splitterMenu && (
         <div
           ref={splitterMenuRef}
-          className="fixed z-[70] menu-popover p-1 min-w-[130px] animate-in fade-in zoom-in-95 duration-100 shadow-xl"
+          className="fixed z-[70] menu-popover p-1 min-w-[130px] pop-in shadow-xl"
           style={{ left: splitterMenuPos.left, top: splitterMenuPos.top }}
         >
           <div className="px-2 py-1 text-[10px] font-semibold text-text-subtle uppercase tracking-wider">
